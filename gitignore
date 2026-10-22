@@ -1,0 +1,9 @@
+# Environnement Python (à ne jamais mettre sur GitHub)
+.venv/
+__pycache__/
+*.pyc
+
+# Fichiers locaux et secrets
+.env
+.streamlit/secrets.toml
+.DS_Store
