@@ -1,4 +1,7 @@
-streamlit>=1.40
-plotly
-pandas
-numpy
+# À placer à côté de app.py dans le dépôt GitHub.
+# Streamlit Cloud installe ces dépendances après commit et push.
+streamlit>=1.50,<2
+plotly>=6,<8
+pandas>=2.2,<3
+numpy>=1.26,<3
+openpyxl>=3.1,<4
