@@ -1,0 +1,4 @@
+indicator,label,source,sex,age_min,age_max,baseline_rate
+episode_depressif_12_mois,Épisode dépressif caractérisé sur 12 mois,"Santé publique France, Baromètre 2024",femmes,18,79,0.182
+episode_depressif_12_mois,Épisode dépressif caractérisé sur 12 mois,"Santé publique France, Baromètre 2024",hommes,18,79,0.128
+trouble_anxieux_generalise_12_mois,Trouble anxieux généralisé sur 12 mois,"Santé publique France, Baromètre 2024",tous,18,79,0.063

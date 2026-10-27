@@ -1,0 +1,4 @@
+need_scenario,annual_relative_change,min_multiplier,max_multiplier
+stable,0.000,1.000,1.000
+besoin_haut,0.004,1.000,1.200
+besoin_bas,-0.003,0.850,1.000
