@@ -971,6 +971,20 @@ def load_geojson():
     with urllib.request.urlopen(GEOJSON_URL, timeout=20) as handle:
         gj = json.load(handle)
     gj["features"] = [f for f in gj["features"] if f["properties"]["code"] in METRO]
+    # Plotly (d3) attend l'anneau extérieur dans le sens horaire, contrairement à
+    # la norme GeoJSON. Sans ce retournement, la projection Lambert remplit le globe.
+    def area(ring):
+        return sum(x0 * y1 - x1 * y0 for (x0, y0), (x1, y1) in zip(ring, ring[1:] + ring[:1]))
+
+    def rewind(polygon):
+        return [ring if (area(ring) < 0) == (i == 0) else ring[::-1] for i, ring in enumerate(polygon)]
+
+    for feature in gj["features"]:
+        geometry = feature["geometry"]
+        if geometry["type"] == "Polygon":
+            geometry["coordinates"] = rewind(geometry["coordinates"])
+        else:
+            geometry["coordinates"] = [rewind(p) for p in geometry["coordinates"]]
     return gj
 
 
@@ -1149,9 +1163,22 @@ def main():
             vmax = vmin + 1
         map_col, table_col = st.columns([2, 1])
         if gj is not None:
-            fig = px.choropleth(selected, geojson=gj, locations="dep", featureidkey="properties.code", color="valeur", color_continuous_scale="Blues", range_color=(vmin, vmax), hover_name="nom", labels={"valeur": value_label})
-            fig.update_geos(fitbounds="locations", visible=False)
-            fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), height=650)
+            # Le premier bleu, presque blanc, se confondait avec le fond.
+            fig = px.choropleth(selected, geojson=gj, locations="dep", featureidkey="properties.code", color="valeur",
+                                color_continuous_scale=px.colors.sequential.Blues[1:], range_color=(vmin, vmax),
+                                hover_name="nom", custom_data=["dep"], labels={"valeur": value_label})
+            unit = " %" if is_share else ""
+            fig.update_traces(marker_line_color="white", marker_line_width=0.6,
+                              hovertemplate="<b>%{hovertext}</b> (%{customdata[0]})<br>%{z:,.1f}" + unit + "<extra></extra>")
+            # Projection conique conforme de Lambert, comme le Lambert 93 officiel :
+            # la France garde ses proportions, au lieu d'être étirée en largeur.
+            fig.update_geos(projection=dict(type="conic conformal", parallels=[44, 49], rotation=dict(lon=3)),
+                            center=dict(lon=2.3, lat=46.3), lonaxis_range=[-5.3, 9.8], lataxis_range=[41.2, 51.2],
+                            visible=False, bgcolor="rgba(0,0,0,0)")
+            fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), height=650, dragmode=False,
+                              paper_bgcolor="rgba(0,0,0,0)", separators=", ",
+                              coloraxis_colorbar=dict(title=dict(text=value_label, side="right"),
+                                                      thickness=12, len=0.6, outlinewidth=0))
             map_col.plotly_chart(fig, width="stretch")
         table_col.dataframe(selected.sort_values("valeur")[["dep", "nom", "valeur"]].rename(columns={"valeur": value_label}), hide_index=True, width="stretch")
         st.caption("Salariés = salariés hospitaliers + autres salariés. Libéraux = libéraux exclusifs + exercice mixte. Chaque personne est comptée une seule fois ; la part salariée est en %.")
