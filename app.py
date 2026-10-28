@@ -97,7 +97,9 @@ VACANCY_OBSERVATIONS = (
 )
 METRO = {f"{n:02d}" for n in range(1, 96) if n != 20} | {"2A", "2B"}
 DES_YEARS = 5
-STUDY_YEARS = 6 + DES_YEARS  # Durée nominale ; aucune moyenne empirique fournie.
+STUDY_YEARS = 5 + DES_YEARS  # Depuis l'entrée en deuxième année ; réglable.
+FLOW_ALLOCATION = "Installations estimées (delta + retraites)"
+STOCK_ALLOCATION = "Répartition des effectifs projetés"
 SMOOTH_FLOOR = 1.0  # Psychiatre ; raccord C1 à la fonction identité.
 REGIONS = {
     "11": "Île-de-France", "24": "Centre-Val de Loire",
@@ -379,7 +381,6 @@ def logistic_fit(years, successes, totals, pseudocount=0.0):
     """Logit binomial agrégé (constante + année), Newton avec recherche de pas.
 
     La demi-observation optionnelle évite les séparations sur petits effectifs.
-    Pour les taux nationaux publiés, totals=1 donne le même poids à chaque année.
     La très faible pénalisation numérique ne concerne que la pente.
     """
     years, successes, totals = [np.asarray(v, dtype=float) for v in (years, successes, totals)]
@@ -457,25 +458,36 @@ def vacancy_history():
 
 
 def vacancy_projection(start, anchor, end):
-    """Tendance nationale, incluant 2026 ; raccord au dernier taux réellement publié."""
+    """Tendance linéaire des taux ; raccord au dernier taux réellement publié.
+
+    MCO avec constante et poids égaux par année. Seule la pente est prolongée,
+    en fractions par an. Les proportions projetées sont bornées entre 0 et 1.
+    """
     observed = vacancy_history()
     observed = observed[observed.annee <= anchor]
     estimation = observed[observed.annee >= start]
     if len(estimation) < 5:
         raise ValueError("Au moins cinq années sont nécessaires pour la tendance d'internat.")
-    fit = logistic_fit(estimation.annee, estimation.taux, np.ones(len(estimation)))
+    x = estimation.annee.to_numpy(dtype=float)
+    y = estimation.taux.to_numpy(dtype=float)
+    centered = x - x.mean()
+    slope = float(np.dot(centered, y - y.mean()) / np.dot(centered, centered))
     last = observed.sort_values("annee").iloc[-1]
     years = np.arange(int(observed.annee.min()), end + 1)
     curve = pd.DataFrame({"annee": years})
-    curve["taux_projete"] = anchored_logistic(float(last.taux), fit["slope"], years - last.annee)
+    raw = float(last.taux) + slope * (years - last.annee)
+    curve["taux_projete"] = np.clip(raw, 0.0, 1.0)
+    curve["borne_atteinte"] = (years > last.annee) & ((raw < 0.0) | (raw > 1.0))
     curve["taux_observe"] = curve.annee.map(observed.set_index("annee").taux)
     curve["taux"] = curve.taux_observe.fillna(curve.taux_projete)
     # On compare une dégradation future à un comportement constant à l'ancrage.
     # Le niveau déjà observé n'est pas soustrait une seconde fois aux stocks DREES.
     baseline = float(curve.loc[curve.annee == anchor, "taux"].iloc[0])
+    if baseline >= 1.0:
+        raise ValueError("Le taux de référence est de 100 % : le coefficient relatif de remplissage n'est pas défini.")
     curve["coefficient"] = np.where(curve.annee > anchor,
                                      np.minimum(1.0, (1 - curve.taux) / (1 - baseline)), 1.0)
-    return curve, {"pente_logit": fit["slope"], "taux_reference": baseline,
+    return curve, {"pente_annuelle": slope, "taux_reference": baseline,
                    "derniere_observation": int(last.annee), "debut": start}
 
 
@@ -497,11 +509,12 @@ def prepare_national_flows(reference, parameters, context):
     flows["flux_fr_reference"] = flows.psychiatrie / DES_YEARS
     flows["flux_fr_corrige"] = flows.flux_fr_reference * flows.coefficient_entrees
     # Conversion France -> métropole par la calibration des formations et leur mobilité.
-    retention = context["routing"].groupby("origine").part.sum()
-    weights = context["weights"].copy()
-    weights["contribution_metro"] = weights.poids * weights.origine.map(retention).fillna(0.0)
-    shares = weights.groupby("scenario").contribution_metro.sum()
-    flows["part_flux_metropole"] = flows.scenario.map(shares)
+    retention = context["routing"].groupby(["origine", "annee"], as_index=False).part.sum()
+    weights = context["weights"].merge(retention, on="origine", validate="many_to_many")
+    weights["contribution_metro"] = weights.poids * weights.part
+    shares = weights.groupby(["scenario", "annee"]).contribution_metro.sum()
+    keys = pd.MultiIndex.from_frame(flows[["scenario", "annee"]])
+    flows["part_flux_metropole"] = shares.reindex(keys).to_numpy()
     if flows.part_flux_metropole.isna().any() or not flows.part_flux_metropole.between(0, 1 + 1e-8).all():
         raise ValueError("Calibration France/métropole invalide pour les flux d'internes.")
     flows["manque_annuel_metro"] = (flows.flux_fr_reference - flows.flux_fr_corrige) * flows.part_flux_metropole
@@ -614,13 +627,8 @@ def training_students(path, anchor, names):
     return stocks, weights
 
 
-def diploma_mobility(path, anchor):
-    """P(lieu d'exercice | lieu de diplôme), psychiatres RPPS à l'ancrage.
-
-    Garder les destinations hors métropole au dénominateur. Les lignes marginales
-    ne sont pas ajoutées aux cellules. Les zéros omis sont autorisés uniquement
-    lorsque les cellules reconstituent les marges de chaque origine.
-    """
+def diploma_history(path, anchor):
+    """Comptes annuels par lieu de diplôme et région d'exercice, dont le code 99."""
     require_excel_reader()
     book = openpyxl.load_workbook(path, read_only=True, data_only=True)
     records = []
@@ -633,25 +641,164 @@ def diploma_mobility(path, anchor):
         for row in rows:
             if normalize(row[p["specialites"]]) != "psychiatrie":
                 continue
-            value = row[p[f"effectif_{anchor}"]]
-            if not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0:
-                raise ValueError("Cellule de mobilité RPPS manquante ou invalide.")
-            records.append({"origine": str(row[p["region_diplome"]]).split("-", 1)[0].strip().zfill(2),
-                            "destination": str(row[p["region"]]).split("-", 1)[0].strip().zfill(2),
-                            "effectif": float(value)})
+            for column, index in p.items():
+                if not re.fullmatch(r"effectif_\d{4}", column) or int(column[-4:]) > anchor:
+                    continue
+                value = row[index]
+                if not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0:
+                    raise ValueError(f"Cellule de mobilité manquante ou invalide : {column}.")
+                records.append({"origine": str(row[p["region_diplome"]]).split("-", 1)[0].strip().zfill(2),
+                                "destination": str(row[p["region"]]).split("-", 1)[0].strip().zfill(2),
+                                "annee": int(column[-4:]), "effectif": float(value)})
     finally:
         book.close()
     cells = pd.DataFrame(records)
-    if cells.empty or cells.duplicated(["origine", "destination"]).any():
+    if cells.empty or cells.duplicated(["origine", "destination", "annee"]).any():
         raise ValueError("Matrice diplôme/exercice absente ou dupliquée.")
-    margins = cells[(cells.destination == "00") & cells.origine.isin(REGIONS)].set_index("origine").effectif
-    detail = cells[(cells.destination != "00") & cells.origine.isin(REGIONS)].copy()
-    sums = detail.groupby("origine").effectif.sum().reindex(margins.index, fill_value=0)
+    years = sorted(cells.annee.unique())
+    if years != list(range(min(years), anchor + 1)):
+        raise ValueError("Historique des lieux de diplôme incomplet.")
+    margins = cells[(cells.destination == "00") & (cells.origine != "00")].set_index(["origine", "annee"]).effectif
+    detail = cells[(cells.destination != "00") & (cells.origine != "00")].copy()
+    origins = sorted(margins.index.get_level_values("origine").unique())
+    complete_margins = pd.MultiIndex.from_product([origins, years], names=["origine", "annee"])
+    if not margins.index.sort_values().equals(complete_margins) or "99" not in origins:
+        raise ValueError("Marges annuelles ou origine 99 absentes de la matrice de diplôme.")
+    sums = detail.groupby(["origine", "annee"]).effectif.sum().reindex(margins.index, fill_value=0)
     if not np.allclose(sums, margins, atol=0.01, rtol=0):
         raise ValueError("La matrice diplôme/exercice ne reconstitue pas ses marges.")
-    detail = detail[detail.origine.isin(margins[margins > 0].index)].copy()
-    detail["part"] = detail.effectif / detail.origine.map(margins)
-    return detail[["origine", "destination", "part"]]
+    # Les cellules absentes ne sont des zéros qu'après vérification des marges.
+    destinations = sorted(cells.loc[cells.destination != "00", "destination"].unique())
+    grid = pd.MultiIndex.from_product([origins, destinations, years], names=["origine", "destination", "annee"])
+    result = detail.set_index(["origine", "destination", "annee"]).effectif.reindex(grid, fill_value=0).reset_index()
+    return result
+
+
+def project_diploma_distribution(history, parameters, anchor, end):
+    """Stocks linéaires raccordés, puis I(t)=max(0, N(t)-(1-r)N(t-1))."""
+    start = parameters["debut"]
+    retirement = parameters["retraite"] / 100.0
+    selected = history[history.annee.between(start, anchor)].copy()
+    expected_years = list(range(start, anchor + 1))
+    if (len(expected_years) < 5 or sorted(selected.annee.unique()) != expected_years
+            or not selected.groupby(["origine", "destination"]).size().eq(len(expected_years)).all()):
+        raise ValueError("Fenêtre d'estimation diplôme/exercice incomplète.")
+    x = selected.annee - np.mean(expected_years)
+    selected["produit"], selected["carre"] = x * selected.effectif, x * x
+    sums = selected.groupby(["origine", "destination"])[["produit", "carre"]].sum()
+    slopes = (sums.produit / sums.carre).rename("pente")
+    base = history[history.annee == anchor].set_index(["origine", "destination"]).effectif.rename("ancrage")
+    previous = history[history.annee == anchor - 1].set_index(["origine", "destination"]).effectif
+    models = pd.concat([base, slopes], axis=1).reset_index()
+    panel = models.merge(pd.DataFrame({"annee": range(anchor, end + 1)}), how="cross")
+    panel["effectif"] = np.maximum(0.0, panel.ancrage + panel.pente * (panel.annee - anchor))
+    panel = panel.sort_values(["origine", "destination", "annee"]).reset_index(drop=True)
+    panel["precedent"] = panel.groupby(["origine", "destination"]).effectif.shift()
+    at_anchor = panel.annee == anchor
+    keys = pd.MultiIndex.from_frame(panel.loc[at_anchor, ["origine", "destination"]])
+    panel.loc[at_anchor, "precedent"] = previous.reindex(keys).to_numpy()
+    if panel.precedent.isna().any():
+        raise ValueError("Effectif précédent absent pour le calcul des installations.")
+    panel["installations_brutes"] = panel.effectif - (1 - retirement) * panel.precedent
+    panel["installations"] = panel.installations_brutes.clip(lower=0.0)
+    group = ["origine", "annee"]
+    stock_total = panel.groupby(group).effectif.transform("sum")
+    base_total = panel.groupby(group).ancrage.transform("sum")
+    base_share = np.divide(panel.ancrage.to_numpy(), base_total.to_numpy(), out=np.zeros(len(panel)), where=base_total.to_numpy() > 0)
+    stock_share = np.divide(panel.effectif.to_numpy(), stock_total.to_numpy(), out=base_share.copy(), where=stock_total.to_numpy() > 0)
+    if parameters["methode"] == FLOW_ALLOCATION:
+        flow_total = panel.groupby(group).installations.transform("sum")
+        panel["part"] = np.divide(panel.installations.to_numpy(), flow_total.to_numpy(), out=stock_share.copy(), where=flow_total.to_numpy() > 0)
+        panel["repli"] = np.where(flow_total > 0, "Aucun", np.where(stock_total > 0, "Effectifs projetés", "Répartition à l'ancrage"))
+    else:
+        panel["part"] = stock_share
+        panel["repli"] = np.where(stock_total > 0, "Aucun", "Répartition à l'ancrage")
+    # Les origines intégralement nulles sont indisponibles, pas renormalisées arbitrairement.
+    nonzero = base_total > 0
+    totals = panel[nonzero].groupby(group).part.sum()
+    if not np.allclose(totals, 1.0, atol=1e-10) or not panel.part.between(0, 1).all():
+        raise ValueError("Répartition d'installations invalide.")
+    panel["projete"] = panel.annee > anchor
+    return panel
+
+
+def annual_routing(panel, baseline):
+    routing = panel[["origine", "destination", "annee", "part"]].merge(
+        baseline[["dep", "region_code", "part_regionale"]],
+        left_on="destination", right_on="region_code", validate="many_to_many")
+    routing["part"] *= routing.part_regionale
+    return routing[["origine", "annee", "dep", "part"]]
+
+
+def accumulate_arrivals(reference, cohorts, routing):
+    """Router chaque cohorte avec les parts de son année, puis cumuler sans sorties."""
+    distributed = cohorts.merge(routing, on=["origine", "annee"], validate="many_to_many")
+    distributed["flux_ajoute"] = distributed.flux_ajoute * distributed.part
+    annual = distributed.groupby(["dep", "annee", "scenario"], as_index=False).flux_ajoute.sum()
+    result = reference.loc[reference.projete, ["dep", "annee", "scenario"]].merge(
+        annual, on=["dep", "annee", "scenario"], how="left", validate="one_to_one")
+    result["flux_ajoute"] = result.flux_ajoute.fillna(0.0)
+    result = result.sort_values(["scenario", "dep", "annee"])
+    result["cumul"] = result.groupby(["scenario", "dep"]).flux_ajoute.cumsum()
+    return result
+
+
+def foreign_reference_flows(panel, retirement, anchor):
+    """Flux national de diplômés étrangers, puis écart annuel au flux observé en b.
+
+    Le max est appliqué APRÈS agrégation. La destination 99 (COM ou étranger)
+    n'est pas une région d'exercice française identifiable et reste exclue.
+    Les écarts au flux de référence peuvent être signés, jamais les flux eux-mêmes.
+    """
+    foreign = panel[(panel.origine == "99") & (panel.destination != "99")]
+    totals = foreign.groupby("annee", as_index=False)[["effectif", "precedent"]].sum()
+    totals["flux_reference"] = (totals.effectif - (1 - retirement) * totals.precedent).clip(lower=0.0)
+    baseline = totals.loc[totals.annee == anchor, "flux_reference"]
+    if len(baseline) != 1:
+        raise ValueError("Flux étranger de l'année de référence absent ou ambigu.")
+    totals["flux_ancrage"] = float(baseline.iloc[0])
+    totals["ecart_flux"] = np.where(totals.annee > anchor, totals.flux_reference - totals.flux_ancrage, 0.0)
+    totals["origine"] = "99"
+    return totals
+
+
+def foreign_france_distribution(panel):
+    """Répartition conditionnelle à une installation en France, DROM inclus.
+
+    Le flux calculé porte sur la France : les parts sont renormalisées sur ce
+    même champ avant de retenir les départements métropolitains de l'application.
+    """
+    france = panel[(panel.origine == "99") & (panel.destination != "99")].copy()
+    total = france.groupby("annee").part.transform("sum").to_numpy()
+    current = france.groupby("annee").effectif.transform("sum").to_numpy()
+    initial = france.groupby("annee").ancrage.transform("sum").to_numpy()
+    initial_parts = np.divide(france.ancrage.to_numpy(), initial, out=np.zeros(len(france)), where=initial > 0)
+    fallback = np.divide(france.effectif.to_numpy(), current, out=initial_parts.copy(), where=current > 0)
+    france["part"] = np.divide(france.part.to_numpy(), total, out=fallback.copy(), where=total > 0)
+    if not np.allclose(france.groupby("annee").part.sum(), 1.0):
+        raise ValueError("Aucune répartition française disponible pour l'origine 99.")
+    return france
+
+
+def prepare_arrivals(reference, parameters, context):
+    flows = context["national_flows"]
+    training = flows[["annee", "scenario", "flux_fr_corrige"]].merge(context["weights"], on="scenario", validate="many_to_many")
+    training["flux_reference"] = training.flux_fr_corrige * training.poids
+    first = parameters["formation"]["rentree"] + parameters["formation"]["delai"]
+    increases = training.origine.map(lambda code: parameters["formation"].get(f"region_{code}", 0) / 100.0)
+    training["flux_ajoute"] = np.where(training.annee >= first, training.flux_reference * increases, 0.0)
+    panel = context["mobility_panel"]
+    foreign = foreign_reference_flows(panel, parameters["mobilite"]["retraite"] / 100.0, context["anchor"])
+    foreign = foreign.merge(pd.DataFrame({"scenario": sorted(reference.scenario.unique())}), how="cross")
+    foreign["flux_hausse"] = np.where(foreign.annee >= parameters["immigration"]["debut"],
+        foreign.flux_reference * parameters["immigration"]["hausse"] / 100.0, 0.0)
+    foreign["flux_ajoute"] = foreign.ecart_flux + foreign.flux_hausse
+    routing = annual_routing(foreign_france_distribution(panel), context["baseline"])
+    return {"training_cohorts": training, "foreign_cohorts": foreign,
+            "training_arrivals": accumulate_arrivals(reference, training, context["routing"]),
+            "foreign_routing": routing,
+            "foreign_trend_arrivals": accumulate_arrivals(reference, foreign.assign(flux_ajoute=foreign.ecart_flux), routing),
+            "foreign_arrivals": accumulate_arrivals(reference, foreign.assign(flux_ajoute=foreign.flux_hausse), routing)}
 
 
 def count_reference(frame, baseline, count_column="effectif"):
@@ -690,14 +837,13 @@ def build_context(history, names, stocks, weights, mobility):
     baseline["part_regionale"] = baseline.effectif / baseline.groupby("region_code").effectif.transform("sum")
     trends = estimate_department_trends(history, baseline, int(history.annee.min()), anchor)
     baseline = baseline.merge(trends, on="dep", validate="one_to_one")
-    routing = mobility.merge(baseline[["dep", "region_code", "part_regionale"]],
-                             left_on="destination", right_on="region_code", validate="many_to_many")
-    routing["part"] *= routing.part_regionale
-    available = set(mobility.origine) & set(weights.loc[weights.poids > 0, "origine"])
+    origin_totals = mobility[mobility.annee == anchor].groupby("origine").effectif.sum()
+    available = set(origin_totals[origin_totals > 0].index) & set(weights.loc[weights.poids > 0, "origine"]) & set(REGIONS)
     return {"anchor": anchor, "baseline": baseline, "stocks": stocks,
             "history": history.copy(deep=True),
             "status_models": fit_status_models(history, anchor),
-            "weights": weights, "mobility": mobility, "routing": routing,
+            "weights": weights, "mobility_history": mobility,
+            "mobility_start": int(mobility.annee.min()),
             "available": available, "observed_start": int(history.annee.min())}
 
 
@@ -720,29 +866,34 @@ def department_dynamics(projected, parameters, context):
 
 
 def training_additions(projected, parameters, context):
-    """Hausse annuelle permanente ; cumul des cohortes après bac+11, sans sorties."""
-    result = projected.copy()
-    weights = context["weights"].copy()
-    weights["hausse"] = weights.origine.map(lambda code: parameters.get(f"region_{code}", 0) / 100)
-    if (weights.hausse == 0).all():
-        return result
-    first_graduation = parameters["rentree"] + STUDY_YEARS
-    stocks = context["stocks"].copy().sort_values(["scenario", "annee"])
-    flow_keys = pd.MultiIndex.from_frame(stocks[["scenario", "annee"]])
-    corrected = context["national_flows"].set_index(["scenario", "annee"]).flux_fr_corrige
-    stocks["flux_psy"] = np.where(stocks.annee >= first_graduation,
-                                   corrected.reindex(flow_keys, fill_value=0.0).to_numpy(), 0.0)
-    stocks["cohortes_cumulees"] = stocks.groupby("scenario").flux_psy.cumsum()
-    allocation = weights.merge(context["routing"][["origine", "dep", "part"]], on="origine", validate="many_to_many")
-    allocation["coefficient"] = allocation.poids * allocation.hausse * allocation.part
-    coefficients = allocation.groupby(["scenario", "dep"]).coefficient.sum()
-    flux = stocks.set_index(["scenario", "annee"]).cohortes_cumulees
-    keys = pd.MultiIndex.from_frame(result[["scenario", "annee"]])
-    if not keys.isin(flux.index).all():
-        raise ValueError("Stocks d'internes manquants pour certaines années projetées.")
-    dep_keys = pd.MultiIndex.from_frame(result[["scenario", "dep"]])
-    result["effectif"] += flux.reindex(keys).to_numpy() * coefficients.reindex(dep_keys, fill_value=0).to_numpy()
+    """Hausse permanente des cohortes de deuxième année, routage annuel puis cumul."""
+    return add_arrival_stock(projected, context["training_arrivals"])
+
+
+def immigration_additions(projected, parameters, context):
+    """Hausse des arrivées de diplômés à l'étranger, sans délai de formation."""
+    return add_arrival_stock(projected, context["foreign_arrivals"])
+
+
+def foreign_trend_adjustment(projected, parameters, context):
+    """Écart cumulé au flux étranger de b, actif même à 0 % de hausse."""
+    result = add_arrival_stock(projected, context["foreign_trend_arrivals"])
+    result["effectif"] = result.effectif.clip(lower=0.0)
     return result
+
+
+def add_arrival_stock(projected, arrivals):
+    result = projected.copy()
+    keys = pd.MultiIndex.from_frame(result[["dep", "annee", "scenario"]])
+    added = arrivals.set_index(["dep", "annee", "scenario"]).cumul.reindex(keys)
+    if added.isna().any():
+        raise ValueError("Cumul des installations absent pour certaines lignes.")
+    result["effectif"] += added.to_numpy()
+    return result
+
+
+def calibration_only(projected, parameters, context):
+    return projected
 
 
 # ---------- Modulations indépendantes, interface générée depuis le registre ----------
@@ -785,6 +936,14 @@ def modulation_registry(context):
         for code, label in sorted(REGIONS.items(), key=lambda item: item[1])
     )
     return (
+        Modulation("mobilite", "Installations selon le lieu de diplôme",
+                   "Extrapolation annuelle des effectifs par diplôme et région d'exercice. Le taux de retraite sert à reconstituer les flux ; il ne réduit pas une seconde fois la référence DREES.",
+                   (Control("methode", "Méthode de répartition des installations", "select", FLOW_ALLOCATION,
+                            options=(FLOW_ALLOCATION, STOCK_ALLOCATION)),
+                    Control("retraite", "Taux annuel uniforme de départ à la retraite (%)", "number", 3.0, 0.0, 20.0, 0.1,
+                            help="Hypothèse réglable, non estimée : installations = max(0, effectif courant − (1 − taux) × effectif précédent)."),
+                    Control("debut", "Première année pour les dynamiques diplôme/exercice", "number",
+                            context["mobility_start"], context["mobility_start"], context["anchor"] - 4, 1)), calibration_only),
         Modulation("dynamique", "Dynamiques départementales",
                    f"Tendances des effectifs (psychiatres par an), estimées jusqu'à {context['anchor']}. Effet dès {context['anchor'] + 1}, indépendant du délai de formation.",
                    (Control("active", "Extrapoler les dynamiques départementales", "checkbox", True),
@@ -792,17 +951,26 @@ def modulation_registry(context):
                             context["observed_start"], context["anchor"] - 4, 1,
                             help="Tout l'historique par défaut. Choisir 2017 pour dix années, ou 2022 pour cinq années avec les sources 2026. Une fenêtre courte peut modifier fortement la pente.")), department_dynamics),
         Modulation("internat", "Dynamique nationale de l'internat",
-                   "Correction uniforme des futures cohortes. La tendance inclut l'amélioration de 2026 ; les cohortes déjà entrées ne sont pas corrigées.",
+                   "Correction uniforme des futures cohortes par une tendance linéaire du taux de postes non pourvus. L'amélioration de 2026 est incluse.",
                    (Control("active", "Appliquer la correction des postes non pourvus", "checkbox", True),
                     Control("debut", "Première année pour la tendance des postes non pourvus", "number",
                             min(v[0] for v in VACANCY_OBSERVATIONS), min(v[0] for v in VACANCY_OBSERVATIONS),
                             max(v[0] for v in VACANCY_OBSERVATIONS) - 4, 1,
-                            help="Logistique nationale, avec au moins cinq années, jusqu'à la dernière observation. Une tendance à l'amélioration ne crée pas de hausse supplémentaire : le coefficient est plafonné à 1.")),
+                            help="Régression linéaire des taux, avec au moins cinq années, puis raccord au dernier taux observé. Les taux restent entre 0 et 100 %. Une tendance à l'amélioration ne crée pas de hausse supplémentaire : le coefficient est plafonné à 1.")),
                    internat_correction),
+        Modulation("etranger_tendance", "Tendance nationale des arrivées étrangères", "", (), foreign_trend_adjustment),
+        Modulation("immigration", "Diplômés à l'étranger — code 99",
+                   "L'écart annuel au flux de 2026 est cumulé dès 2027, même à 0 %. Le curseur ajoute une hausse permanente de ce flux, sans délai de formation. Le code 99 désigne le lieu du diplôme.",
+                   (Control("hausse", "Hausse des arrivées de diplômés à l'étranger (%)", "slider", 0, 0, 100, 1),
+                    Control("debut", "Première année de hausse des arrivées étrangères", "number", context["anchor"] + 1,
+                            context["anchor"] + 1, int(context["stocks"].annee.max()), 1)), immigration_additions),
         Modulation("formation", "Places de formation par région",
-                   "Première rentrée au niveau du bac ; hausse reconduite pour chaque cohorte. Premiers psychiatres 11 ans plus tard.",
-                   (Control("rentree", "Première rentrée augmentée (année du bac)", "number", context["anchor"] + 1,
-                            context["anchor"] + 1, int(context["stocks"].annee.max()) - STUDY_YEARS, 1),) + regional_controls,
+                   "Hausse des places en deuxième année, reconduite pour chaque cohorte. Répartition prévue pour l'année d'installation.",
+                   (Control("rentree", "Première rentrée augmentée en deuxième année", "number", context["anchor"] + 1,
+                            context["anchor"] + 1, int(context["stocks"].annee.max()) - DES_YEARS, 1),
+                    Control("delai", "Délai deuxième année → installation (années)", "number", STUDY_YEARS,
+                            DES_YEARS, 20, 1,
+                            help="Dix ans par défaut : cinq ans avant le DES, puis cinq ans de DES. Le délai du DES utilisé pour les postes non pourvus reste de cinq ans.")) + regional_controls,
                    training_additions),
     )
 
@@ -827,14 +995,24 @@ def validate_parameters(parameters, registry):
                 raise ValueError(f"Valeur booléenne attendue : {control.label}.")
             elif control.kind == "select" and value not in control.options:
                 raise ValueError(f"Option invalide : {control.label}.")
+    formation = parameters["formation"]
+    end = next(m for m in registry if m.key == "immigration").controls[1].maximum
+    if formation["rentree"] + formation["delai"] > end:
+        raise ValueError(f"La première installation doit intervenir au plus tard en {end}. Réduire la rentrée ou le délai.")
 
 
 def apply_modulations(reference, parameters, context, return_contributions=False, return_details=False):
     registry = modulation_registry(context)
     validate_parameters(parameters, registry)
-    flows, curve, calibration = prepare_national_flows(reference, parameters["internat"], context)
     run_context = deepcopy(context)
+    mobility_panel = project_diploma_distribution(context["mobility_history"], parameters["mobilite"],
+                                                  context["anchor"], int(reference.annee.max()))
+    run_context["mobility_panel"] = mobility_panel
+    run_context["routing"] = annual_routing(mobility_panel, context["baseline"])
+    flows, curve, calibration = prepare_national_flows(reference, parameters["internat"], run_context)
     run_context["national_flows"] = flows
+    arrival_details = prepare_arrivals(reference, parameters, run_context)
+    run_context.update(arrival_details)
     result = reference.copy(deep=True)
     projected = result[result.projete].copy()
     immutable = [c for c in projected if c != "effectif"]
@@ -859,7 +1037,12 @@ def apply_modulations(reference, parameters, context, return_contributions=False
     if not np.allclose(result.salaries + result.liberaux, result.effectif, atol=1e-8, rtol=1e-12):
         raise ValueError("Les comptes par statut ne reconstituent pas le total.")
     if return_details:
-        return result, contributions, {"national_flows": flows, "vacancy_curve": curve, "vacancy_calibration": calibration}
+        keys = pd.MultiIndex.from_frame(projected[["dep", "annee", "scenario"]])
+        requested = run_context["foreign_trend_arrivals"].set_index(["dep", "annee", "scenario"]).cumul.reindex(keys).to_numpy()
+        limited = int((~np.isclose(contributions.loc[projected.index, "etranger_tendance"], requested, atol=1e-8, rtol=1e-10)).sum())
+        return result, contributions, {"national_flows": flows, "vacancy_curve": curve,
+            "vacancy_calibration": calibration, "mobility_panel": mobility_panel,
+            "routing": run_context["routing"], "foreign_trend_limited_rows": limited, **arrival_details}
     return (result, contributions) if return_contributions else result
 
 
@@ -908,7 +1091,7 @@ def load_reference(signature):
         mode = "national"
     reference, anchor = assemble_reference(history, names, regional)
     stocks, weights = training_students(DREES_PATH, anchor, names)
-    mobility = diploma_mobility(RPPS_PATH, anchor)
+    mobility = diploma_history(RPPS_PATH, anchor)
     context = build_context(history, names, stocks, weights, mobility)
     expected = pd.MultiIndex.from_frame(reference[["annee", "scenario"]].drop_duplicates())
     future = expected[expected.get_level_values("annee") >= anchor]
@@ -944,6 +1127,9 @@ def ensure_projections(signature, parameters, reference, metadata, context):
 def render_parameters(applied, registry):
     draft = {}
     for modulation in registry:
+        if not modulation.controls:
+            draft[modulation.key] = {}
+            continue
         st.subheader(modulation.label)
         st.caption(modulation.description)
         values = {}
@@ -997,9 +1183,12 @@ def dynamics_diagnostic(panel, contributions, context, scenario):
     diagnostic["effectif_reference"] = pieces.reference
     diagnostic["effet_dynamique"] = pieces.dynamique
     diagnostic["effet_internat"] = pieces.internat
+    diagnostic["tendance_etranger"] = pieces.etranger_tendance
+    diagnostic["ajout_immigration"] = pieces.immigration
     diagnostic["ajout_formation"] = pieces.formation
-    diagnostic["hors_formation"] = pieces.reference + pieces.dynamique + pieces.internat
-    diagnostic["reference_nationale"] = count_reference(diagnostic, context["baseline"], "hors_formation")
+    diagnostic["avant_ajouts"] = pieces.reference + pieces.dynamique + pieces.internat
+    diagnostic["hors_formation"] = diagnostic.avant_ajouts + pieces.etranger_tendance + pieces.immigration
+    diagnostic["reference_nationale"] = count_reference(diagnostic, context["baseline"], "avant_ajouts")
     diagnostic["ecart_hors_formation"] = diagnostic.hors_formation - diagnostic.reference_nationale
     diagnostic["ecart_complet"] = diagnostic.effectif - diagnostic.reference_nationale
     return diagnostic
@@ -1031,21 +1220,21 @@ def dynamics_figure(diagnostic, context, departments, full=False, start_year=Non
                                        line={"color": colors[index % len(colors)], "dash": "dot", "width": 1}, opacity=0.6,
                                        hovertemplate="%{x} : %{y:.2f} psychiatres<extra>%{fullData.name}</extra>"))
     figure.add_hline(y=0, line_color="#64748b", line_width=1,
-                    annotation_text=f"Part de l'effectif national fixée en {anchor}, sans nouvelles places")
+                    annotation_text=f"Part nationale fixée en {anchor}, avant évolution étrangère et nouvelles places")
     figure.add_vline(x=anchor, line_color="#94a3b8", line_dash="dot")
     figure.update_layout(height=570, xaxis_title="Année", yaxis_title="Écart à la référence nationale (nombre de psychiatres)",
                          margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified")
     return figure
 
 
-def calibration_table(reference, context, scenario, parameters, flows):
-    first = parameters["formation"]["rentree"] + STUDY_YEARS
+def calibration_table(reference, context, scenario, parameters, flows, routing):
+    first = parameters["formation"]["rentree"] + parameters["formation"]["delai"]
     row = flows[(flows.scenario == scenario) & (flows.annee == first)].iloc[0]
     flow = float(row.flux_fr_corrige)
     national = float(row.total_reference * row.coefficient_stock)
     weights = context["weights"]
     weights = weights[weights.scenario == scenario].set_index("origine").poids
-    retention = context["routing"].groupby("origine").part.sum()
+    retention = routing[routing.annee == first].groupby("origine").part.sum()
     records = []
     for code, label in REGIONS.items():
         available = code in context["available"]
@@ -1082,7 +1271,7 @@ def vacancy_figure(curve, calibration):
     future = curve[curve.annee >= last]
     figure = go.Figure()
     figure.add_trace(go.Scatter(x=observed.annee, y=100 * observed.taux_observe, mode="lines+markers", name="Observé"))
-    figure.add_trace(go.Scatter(x=future.annee, y=100 * future.taux_projete, mode="lines", name="Extrapolation logistique", line_dash="dash"))
+    figure.add_trace(go.Scatter(x=future.annee, y=100 * future.taux_projete, mode="lines", name="Extrapolation linéaire", line_dash="dash"))
     figure.add_hline(y=100 * calibration["taux_reference"], line_dash="dot", annotation_text="Taux de référence constant")
     figure.update_layout(height=420, xaxis_title="Année d'entrée en internat", yaxis_title="Postes non pourvus (%)",
                          yaxis_range=[0, 100], hovermode="x unified")
@@ -1134,10 +1323,11 @@ def main():
     else:
         st.caption("Référence issue des projections régionales détaillées de psychiatrie.")
     if proposed["dynamique"]["active"]:
-        st.caption(f"Paramètres validés : dynamiques des effectifs actives dès {anchor + 1}, estimées sur {proposed['dynamique']['debut']}–{anchor}. Les pentes sont en psychiatres par an ; le total national est conservé à cette étape, puis la correction de l’internat et les ajouts de places sont appliqués.")
+        st.caption(f"Paramètres validés : dynamiques des effectifs actives dès {anchor + 1}, estimées sur {proposed['dynamique']['debut']}–{anchor}. Le total national est conservé à cette étape, puis la correction de l’internat et les hausses d'arrivées et de places sont appliquées.")
     else:
         st.warning(f"Paramètres validés : dynamiques départementales désactivées. Leur pente n'est pas appliquée. Pour les activer dès {anchor + 1}, cocher la case dans le formulaire puis cliquer sur Valider.")
     state = st.session_state.psy_projection
+    st.caption(f"Répartition validée : {proposed['mobilite']['methode']} ; retraites {proposed['mobilite']['retraite']:.1f} % par an. Places en deuxième année : premières installations en {proposed['formation']['rentree'] + proposed['formation']['delai']}. Code 99 : tendance nationale active dès {anchor + 1}, plus hausse de {proposed['immigration']['hausse']} % dès {proposed['immigration']['debut']}.")
     if proposed["internat"]["active"]:
         st.caption(f"Correction nationale des cohortes activée : premiers effets possibles sur les effectifs en {anchor + 1 + DES_YEARS}. Les observations restent inchangées.")
     else:
@@ -1146,7 +1336,7 @@ def main():
         indicator = st.selectbox("Indicateur", list(INDICATORS.values()))
         scenario = st.selectbox("Scénario", sorted(df.scenario.unique()))
         year = st.slider("Année", int(df.annee.min()), int(df.annee.max()), anchor)
-    tab_map, tab_trends, tab_status, tab_internat, tab_method = st.tabs(["Carte et effectifs", "Dynamiques départementales", "Statuts d’exercice", "Internat national", "Calibration et hypothèses"])
+    tab_map, tab_trends, tab_status, tab_internat, tab_mobility, tab_method = st.tabs(["Carte et effectifs", "Dynamiques départementales", "Statuts d’exercice", "Internat national", "Diplômes et installations", "Calibration et hypothèses"])
     names = context["baseline"].set_index("dep").nom.to_dict()
     with tab_map:
         selected = df[(df.indicateur == indicator) & (df.scenario == scenario) & (df.annee == year)].copy()
@@ -1188,8 +1378,8 @@ def main():
         if active:
             st.info(f"Dynamique réellement appliquée : OUI, dès {anchor + 1}. Pente d'effectif estimée sur {start}–{anchor} puis raccordée à l'observation {anchor}.")
         else:
-            st.warning("Dynamique réellement appliquée : NON. La pente d'effectif n'est pas appliquée. Avec le repli national, l'écart reste nul sans nouvelles places. Des projections régionales détaillées peuvent avoir leur propre évolution.")
-        st.write(f"Les courbes montrent un écart en nombre de psychiatres. Chaque effectif est comparé au total national après correction de l’internat et avant nouvelles places, multiplié par la part du département observée en {anchor}. Cette référence est commune aux deux vues.")
+            st.warning("Dynamique réellement appliquée : NON. La tendance nationale des arrivées étrangères reste active, même avec le curseur à 0 %. Elle peut produire des écarts territoriaux. Des projections régionales détaillées peuvent aussi avoir leur propre évolution.")
+        st.write(f"Les courbes montrent un écart en nombre de psychiatres. Chaque effectif est comparé au total national après correction de l’internat, avant tendance étrangère et hausses des places ou des arrivées, multiplié par la part du département observée en {anchor}. Cette référence est commune aux deux vues.")
         view = st.selectbox("Projection affichée", ["Sans ouverture de places", "Avec les ouvertures de places"], key="trend_view")
         full = view == "Avec les ouvertures de places"
         show_fit = st.checkbox("Afficher la droite estimée sur les observations", value=False, key="show_trend_fit")
@@ -1202,11 +1392,11 @@ def main():
             if full:
                 has_places = any(proposed["formation"][f"region_{code}"] for code in REGIONS)
                 if has_places:
-                    st.caption(f"Ouvertures validées : premiers effets en {proposed['formation']['rentree'] + STUDY_YEARS}. Ce délai concerne seulement les places de formation, jamais la tendance départementale.")
+                    st.caption(f"Ouvertures validées : premiers effets en {proposed['formation']['rentree'] + proposed['formation']['delai']}. Ce délai concerne les places de formation ; la hausse des arrivées étrangères intervient sans délai.")
                 else:
                     st.caption("Aucune hausse de places validée : les deux vues coïncident.")
             else:
-                st.caption("Cette vue isole la trajectoire sans les ajouts de places, même si des curseurs régionaux sont positifs. La carte conserve le scénario complet validé.")
+                st.caption("Cette vue exclut les ajouts de places et inclut la tendance des arrivées étrangères ainsi que la hausse validée par le curseur. La carte conserve le scénario complet validé.")
             st.caption(f"Trait plein : observations. Tirets : projection. Toutes les courbes valent zéro à l'ancrage {anchor}. Un plat à zéro signifie que l'effectif suit la référence nationale, pas qu'il est constant. Un écart négatif correspond à moins de psychiatres que cette référence. Le filtre Année de la carte ne coupe pas les courbes.")
             if show_fit:
                 st.caption("Les fines lignes pointillées sont les régressions des écarts d'effectif, avec constante. Le futur repart de l'observation réelle et prolonge la pente estimée. La saturation et la renormalisation conservent le total à cette étape ; la correction nationale de l’internat peut ensuite réduire les niveaux et les écarts départementaux.")
@@ -1219,9 +1409,9 @@ def main():
             with st.expander(f"Décomposition des effectifs en {year}"):
                 detail = diagnostic[(diagnostic.annee == year) & diagnostic.dep.isin(departments)].copy()
                 detail.insert(1, "nom", detail.dep.map(names))
-                st.dataframe(detail[["dep", "nom", "effectif_reference", "effet_dynamique", "effet_internat", "ajout_formation", "effectif"]].rename(
+                st.dataframe(detail[["dep", "nom", "effectif_reference", "effet_dynamique", "effet_internat", "tendance_etranger", "ajout_immigration", "ajout_formation", "effectif"]].rename(
                     columns={"effectif_reference": "Référence sans modulation", "effet_dynamique": "Effet départemental", "effet_internat": "Correction internat",
-                             "ajout_formation": "Ajout des places", "effectif": "Effectif final"}), hide_index=True, width="stretch")
+                             "tendance_etranger": "Tendance étrangère / 2026", "ajout_immigration": "Hausse du curseur étranger", "ajout_formation": "Ajout des places", "effectif": "Effectif final"}), hide_index=True, width="stretch")
                 st.caption("L'effet départemental inclut la saturation et la renormalisation. L'ajout des places est un nombre de psychiatres supplémentaires, toujours positif ou nul.")
         else:
             st.info("Sélectionner au moins un département pour afficher les courbes.")
@@ -1246,7 +1436,10 @@ def main():
         st.write("Le coefficient corrige les arrivées futures, en comparant le taux de remplissage extrapolé à un taux constant de référence. Il s’applique à la cohorte d’entrée en internat, puis produit un effet sur les effectifs cinq ans plus tard.")
         st.info("La série inclut le recul récent des postes non pourvus : 86/554 en 2025 (15,52 %), puis 37/653 en 2026 (5,67 %), hors CESP pour ces deux derniers millésimes. L’évolution n’est donc pas une hausse continue.")
         st.caption(f"Estimation validée : {calibration['debut']}–{calibration['derniere_observation']}. Taux de référence : {100 * calibration['taux_reference']:.2f} %. Correction {'active' if proposed['internat']['active'] else 'désactivée'}. La courbe ci-dessous montre l’extrapolation estimée dans les deux cas.")
+        st.caption(f"Projection linéaire : {100 * calibration['pente_annuelle']:+.3f} point de pourcentage par an, avec raccord au dernier taux observé. Les taux sont limités à l’intervalle 0–100 %.")
         st.plotly_chart(vacancy_figure(state["vacancy_curve"], calibration), width="stretch")
+        if state["vacancy_curve"].borne_atteinte.any():
+            st.warning("La droite extrapolée sort de l’intervalle 0–100 % à certains horizons. Les taux y sont maintenus à la borne correspondante.")
         st.caption(f"Coefficient de flux = min(1, (1 − taux futur) / (1 − taux de référence)). Si la tendance estimée s’améliore, aucune réduction supplémentaire n’est appliquée. Les cohortes entrées au plus tard en {anchor} conservent un coefficient de 1.")
         flows = state["national_flows"]
         shown = flows[flows.scenario == scenario]
@@ -1266,13 +1459,48 @@ def main():
             history_table["Source"] = history_table.source.map(VACANCY_SOURCES)
             st.dataframe(history_table[["annee", "Postes non pourvus (%)", "Source"]].rename(columns={"annee": "Année"}), hide_index=True, width="stretch")
             st.caption("2013–2022 : pourcentages publiés arrondis ; 2023–2026 : rapports calculés à partir des comptes publiés. Les anciennes publications ne précisent pas toutes le traitement des CESP. Cette limite de comparabilité est conservée dans le README.")
+    with tab_mobility:
+        st.write("Les comptes annuels de l’onglet Effectifs par lieu diplome sont extrapolés séparément pour chaque origine de diplôme et région d’exercice, avec une pente linéaire raccordée à 2026 et un plancher à zéro.")
+        st.write("Installations estimées = max(0, effectif de l’année − (1 − taux de retraite) × effectif précédent). Leur répartition est normalisée pour chaque origine et année. L’autre méthode utilise directement les parts des effectifs projetés, sans delta pour la répartition.")
+        st.caption("Le taux de retraite sert à cette reconstitution et au volume du flux étranger ; il n’est pas déduit une seconde fois du stock DREES. Les stocks peuvent refléter des mobilités de carrière et d'autres sorties : les installations ne sont pas directement observées.")
+        available_origins = sorted(state["mobility_panel"].origine.unique())
+        origin_labels = {**REGIONS, "01": "Antilles-Guyane", "98": "Région de diplôme inconnue", "99": "Diplôme obtenu à l’étranger"}
+        origin = st.selectbox("Lieu de diplôme à examiner", available_origins,
+                              index=available_origins.index("99"),
+                              format_func=lambda code: f"{code} · {origin_labels.get(code, code)}", key="mobility_origin")
+        inspection_year = st.slider("Année de la répartition projetée", anchor + 1, int(df.annee.max()),
+                                     max(anchor + 1, year), key="mobility_year")
+        panel = state["mobility_panel"]
+        inspection = foreign_france_distribution(panel) if origin == "99" else panel[panel.origine == origin]
+        detail = inspection[inspection.annee == inspection_year].copy()
+        destination_labels = {**REGIONS, "01": "Guadeloupe", "02": "Martinique", "03": "Guyane", "04": "La Réunion", "06": "Mayotte", "99": "COM ou étranger"}
+        detail["Région d’exercice"] = detail.destination.map(destination_labels).fillna(detail.destination)
+        detail["Part (%)"] = 100 * detail.part
+        st.dataframe(detail[["destination", "Région d’exercice", "precedent", "effectif", "installations", "Part (%)", "repli"]].rename(
+            columns={"destination": "Code", "precedent": "Effectif précédent", "effectif": "Effectif projeté", "installations": "Installations estimées", "repli": "Règle de repli"}), hide_index=True, width="stretch")
+        distribution = inspection.copy()
+        distribution["Part (%)"] = 100 * distribution.part
+        distribution["Région d’exercice"] = distribution.destination.map(destination_labels).fillna(distribution.destination)
+        figure = px.line(distribution, x="annee", y="Part (%)", color="Région d’exercice", labels={"annee": "Année d’installation"})
+        figure.update_layout(height=450, yaxis_range=[0, 100])
+        st.plotly_chart(figure, width="stretch")
+        if (detail.repli != "Aucun").any():
+            st.info("Le flux estimé est nul ou le stock projeté est épuisé pour cette origine : la répartition utilise les effectifs projetés, puis si nécessaire les parts de 2026.")
+        st.caption("Les proportions incluent les destinations hors métropole. Pour le code 99, elles sont conditionnées à une installation en France, DROM inclus, en excluant la destination COM ou étranger. Les parts départementales au sein de chaque région restent celles de 2026. Le code 98 n’est pas assimilé au code 99.")
+        st.write("Code 99 : les effectifs de diplômés à l’étranger exerçant en France sont d’abord agrégés. Le flux annuel vaut max(0, total courant − (1 − retraite) × total précédent). Le max s’applique au total national, et non à chaque région séparément.")
+        st.write(f"La tendance ajoute chaque année l’écart au flux estimé de {anchor}, puis cumule ces écarts à partir de {anchor + 1}. L’ajustement vaut zéro en {anchor}. Il reste actif à 0 % de hausse ; le curseur ajoute séparément un pourcentage du flux annuel, sans délai ni correction des postes vacants français.")
+        st.dataframe(state["foreign_cohorts"].query("scenario == @scenario")[["annee", "effectif", "flux_reference", "flux_ancrage", "ecart_flux", "flux_hausse", "flux_ajoute"]].rename(
+            columns={"annee": "Année d’arrivée", "effectif": "Diplômés étrangers exerçant en France", "flux_reference": "Flux estimé France", "flux_ancrage": f"Flux de référence {anchor}", "ecart_flux": "Écart annuel au flux de référence", "flux_hausse": "Hausse annuelle du curseur", "flux_ajoute": "Ajustement annuel total France"}), hide_index=True, width="stretch")
+        st.caption("Un écart négatif signifie moins d'arrivées que dans le scénario à flux constant de référence, pas un nombre négatif d'installations. La référence 2026 est une convention de scénario supplémentaire ; le flux étranger exactement intégré dans la DREES n'est pas isolé ici.")
+        if state["foreign_trend_limited_rows"]:
+            st.warning("L’écart cumulé aurait rendu certains effectifs départementaux négatifs. Leur correction a été limitée à un effectif nul ; la décomposition montre le retrait effectivement appliqué.")
     with tab_method:
-        first = proposed["formation"]["rentree"] + STUDY_YEARS
-        st.write(f"Places : hausse annuelle permanente à partir de {proposed['formation']['rentree']}, avec premiers effets en {first}. Le délai retenu est de {STUDY_YEARS} ans après le bac : 6 ans avant le DES et 5 ans de DES. C'est une durée nominale, pas une moyenne mesurée.")
+        first = proposed["formation"]["rentree"] + proposed["formation"]["delai"]
+        st.write(f"Places en deuxième année : hausse annuelle permanente à partir de {proposed['formation']['rentree']}, avec premiers effets en {first}. Délai validé : {proposed['formation']['delai']} ans. Le défaut de dix ans correspond à cinq ans avant le DES et cinq ans de DES.")
         st.write("Le stock national d'internes de psychiatrie de chaque année de sortie est divisé par 5 pour approcher un flux annuel. La géographie des places est approchée par les stocks régionaux d'internes toutes spécialités de la dernière année observée. Le flux est ensuite corrigé par le coefficient des postes non pourvus à l’entrée en internat, cinq ans plus tôt, si cette modulation est active.")
-        st.write("Chaque cohorte supplémentaire est répartie selon la matrice diplôme → exercice des psychiatres RPPS, puis selon les parts départementales observées dans chaque région d'exercice. Les destinations hors métropole restent au dénominateur : elles ne sont pas redistribuées aux départements affichés. Les cohortes sont cumulées sans attrition ni retraite supplémentaire jusqu'en 2070.")
+        st.write("Chaque cohorte supplémentaire est répartie selon la matrice diplôme → exercice prédite pour son année d’installation, puis selon les parts départementales observées dans chaque région d'exercice. Les destinations hors métropole restent au dénominateur. Les cohortes sont cumulées sans attrition ni retraite supplémentaire jusqu'en 2070 ; les cohortes déjà arrivées ne sont pas redistribuées à chaque nouvelle année.")
         st.caption("X dépend de la région, du scénario et de l'année. Le tableau tient compte de la correction de l’internat et donne l’effet de +1 % dans une seule région pour la première cohorte diplômée ; ensuite les cohortes s'accumulent. Les nombres fractionnaires sont des effectifs attendus.")
-        st.dataframe(calibration_table(reference, context, scenario, proposed, state["national_flows"]), hide_index=True, width="stretch")
+        st.dataframe(calibration_table(reference, context, scenario, proposed, state["national_flows"], state["routing"]), hide_index=True, width="stretch")
         missing = [REGIONS[code] for code in REGIONS if code not in context["available"]]
         if missing:
             st.warning("Calibration de formation absente pour : " + ", ".join(missing) + ". Une ouverture ex nihilo nécessite des hypothèses supplémentaires ; le curseur reste désactivé. Ces régions peuvent recevoir des diplômés formés ailleurs.")
