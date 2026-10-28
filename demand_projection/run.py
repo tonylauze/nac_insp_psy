@@ -198,7 +198,7 @@ def project_workbook(
     return pd.concat(records, ignore_index=True)
 
 
-def build_projection(data_dir: Path, output_dir: Path, base_year: int) -> pd.DataFrame:
+def build_projection(data_dir: Path, output_dir: Path | None, base_year: int) -> pd.DataFrame:
     parameters = validate_parameters(pd.read_csv(data_dir / "prevalence_parameters.csv"))
     need_scenarios = read_need_scenarios(data_dir / "need_scenarios.csv")
     modifiers = read_territorial_modifiers(data_dir / "territorial_modifiers.csv")
@@ -235,28 +235,13 @@ def build_projection(data_dir: Path, output_dir: Path, base_year: int) -> pd.Dat
             "persons_with_need",
         ],
     ].sort_values(["demographic_scenario", "need_scenario", "indicator", "department", "year"])
+    if output_dir is None:
+        return projection
     output_dir.mkdir(parents=True, exist_ok=True)
     projection.to_csv(output_dir / "demand_projection.csv", index=False, float_format="%.6f")
-    summary_keys = [
-        "department",
-        "year",
-        "demographic_scenario",
-        "need_scenario",
-        "indicator",
-        "label",
-        "source",
-        "age_min",
-        "age_max",
-    ]
-    summary = (
-        projection.groupby(summary_keys, as_index=False)
-        .agg(
-            population_at_risk=("population_at_risk", "sum"),
-            persons_with_need=("persons_with_need", "sum"),
-        )
-        .assign(prevalence=lambda data: data["persons_with_need"] / data["population_at_risk"])
+    summarize_projection(projection).to_csv(
+        output_dir / "demand_projection_summary.csv", index=False, float_format="%.6f"
     )
-    summary.to_csv(output_dir / "demand_projection_summary.csv", index=False, float_format="%.6f")
     metadata = pd.DataFrame(
         {
             "field": ["base_year", "method", "health_data"],
@@ -269,6 +254,29 @@ def build_projection(data_dir: Path, output_dir: Path, base_year: int) -> pd.Dat
     )
     metadata.to_csv(output_dir / "metadata.csv", index=False)
     return projection
+
+
+def summarize_projection(projection: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate sex-specific estimates without adding different indicators."""
+    summary_keys = [
+        "department",
+        "year",
+        "demographic_scenario",
+        "need_scenario",
+        "indicator",
+        "label",
+        "source",
+        "age_min",
+        "age_max",
+    ]
+    return (
+        projection.groupby(summary_keys, as_index=False)
+        .agg(
+            population_at_risk=("population_at_risk", "sum"),
+            persons_with_need=("persons_with_need", "sum"),
+        )
+        .assign(prevalence=lambda data: data["persons_with_need"] / data["population_at_risk"])
+    )
 
 
 def parse_args() -> argparse.Namespace:

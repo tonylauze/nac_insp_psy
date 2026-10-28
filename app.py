@@ -44,6 +44,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from demand_projection.outcomes import prepare_outcomes
 
 try:
     import openpyxl
@@ -66,6 +67,7 @@ def require_excel_reader():
 ROOT = Path(__file__).resolve().parent
 RPPS_PATH = ROOT / "Médecins RPPS 2012-2026.xlsx"
 DREES_PATH = ROOT / "DREES_projections_medecins_2026.xlsx"
+DEMAND_SUMMARY_PATH = ROOT / "dataDemand" / "output" / "demand_projection_summary.csv"
 GEOJSON_URL = "https://raw.githubusercontent.com/gregoiredavid/france-geojson/master/departements-version-simplifiee.geojson"
 COLUMNS = ["dep", "annee", "scenario", "indicateur", "valeur"]
 COUNT = "Effectif de psychiatres"
@@ -1278,6 +1280,126 @@ def vacancy_figure(curve, calibration):
     return figure
 
 
+@st.cache_data(show_spinner=False, max_entries=2)
+def load_demand_summary(path: str, modified_at_ns: int):
+    """Read generated outcomes; the timestamp invalidates the cache."""
+    del modified_at_ns
+    return prepare_outcomes(pd.read_csv(path))
+
+
+@st.cache_data(show_spinner=False, max_entries=2)
+def compute_demand_summary(signature):
+    """Support fresh checkouts without committing generated CSV files."""
+    del signature
+    from demand_projection.run import build_projection, summarize_projection
+
+    return prepare_outcomes(summarize_projection(build_projection(ROOT / "dataDemand", None, 2026)))
+
+
+def demand_outcomes():
+    """Use a current local export, otherwise calculate from versioned inputs."""
+    from demand_projection.run import SCENARIO_FILES
+
+    data_dir = ROOT / "dataDemand"
+    inputs = [data_dir / filename for filename in SCENARIO_FILES.values()]
+    inputs += [data_dir / "prevalence_parameters.csv", data_dir / "need_scenarios.csv",
+               ROOT / "demand_projection" / "run.py", ROOT / "demand_projection" / "outcomes.py"]
+    modifiers = data_dir / "territorial_modifiers.csv"
+    if modifiers.exists():
+        inputs.append(modifiers)
+    signature = tuple((str(path), path.stat().st_mtime_ns, path.stat().st_size) for path in inputs)
+    if DEMAND_SUMMARY_PATH.exists():
+        modified = DEMAND_SUMMARY_PATH.stat().st_mtime_ns
+        if modified >= max(item[1] for item in signature):
+            return load_demand_summary(str(DEMAND_SUMMARY_PATH), modified)
+    return compute_demand_summary(signature)
+
+
+def render_demand_tab():
+    """Display demand outcomes with filters independent of the supply scenario."""
+    st.write("Projection démographique-épidémiologique indépendante de la projection des effectifs de psychiatres.")
+    try:
+        with st.spinner("Chargement des projections de demande…"):
+            demand = demand_outcomes()
+    except (OSError, ValueError, KeyError, ImportError) as exc:
+        st.error(f"Demande de soins indisponible : {exc}")
+        return
+    demographic_scenarios = sorted(demand["demographic_scenario"].unique())
+    need_scenarios = sorted(demand["need_scenario"].unique())
+    indicators = sorted(demand["indicator"].unique())
+    controls_a, controls_b, controls_c = st.columns(3)
+    with controls_a:
+        demand_demographic_scenario = st.selectbox(
+            "Scénario démographique Insee", demographic_scenarios,
+            index=demographic_scenarios.index("Central") if "Central" in demographic_scenarios else 0,
+            key="demand_demographic_scenario",
+        )
+    with controls_b:
+        demand_need_scenario = st.selectbox(
+            "Scénario de besoin", need_scenarios,
+            index=need_scenarios.index("stable") if "stable" in need_scenarios else 0,
+            key="demand_need_scenario",
+        )
+    with controls_c:
+        demand_indicator = st.selectbox(
+            "Indicateur de besoin", indicators,
+            format_func=lambda value: demand.loc[demand["indicator"] == value, "label"].iloc[0],
+            key="demand_indicator",
+        )
+    filtered_demand = demand.loc[
+        (demand["demographic_scenario"] == demand_demographic_scenario)
+        & (demand["need_scenario"] == demand_need_scenario)
+        & (demand["indicator"] == demand_indicator)
+    ].copy()
+    if filtered_demand.empty:
+        st.info("Aucun résultat pour cette combinaison de scénarios et d’indicateur.")
+        return
+    departments_demand = sorted(filtered_demand["department"].unique())
+    default_demand_departments = ["Paris"] if "Paris" in departments_demand else departments_demand[:1]
+    selected_demand_departments = st.multiselect(
+        "Départements à comparer", departments_demand, default=default_demand_departments,
+        key="demand_departments",
+    )
+    selected_demand = filtered_demand[filtered_demand["department"].isin(selected_demand_departments)].copy()
+    national_demand = filtered_demand.groupby("year", as_index=False)["persons_with_need"].sum()
+    first_demand_year = int(national_demand["year"].min())
+    last_demand_year = int(national_demand["year"].max())
+    first_demand_value = national_demand.loc[national_demand["year"] == first_demand_year, "persons_with_need"].iloc[0]
+    last_demand_value = national_demand.loc[national_demand["year"] == last_demand_year, "persons_with_need"].iloc[0]
+    demand_change = last_demand_value / first_demand_value - 1 if first_demand_value else 0.0
+    metric_a, metric_b, metric_c = st.columns(3)
+    metric_a.metric(f"Personnes avec besoin projeté — France, {first_demand_year}", f"{first_demand_value:,.0f}".replace(",", " "))
+    metric_b.metric(f"Personnes avec besoin projeté — France, {last_demand_year}", f"{last_demand_value:,.0f}".replace(",", " "))
+    metric_c.metric(f"Évolution {first_demand_year}–{last_demand_year}", f"{demand_change:+.1%}" if first_demand_value else "Non calculable")
+    if selected_demand.empty:
+        st.info("Sélectionnez au moins un département pour afficher les résultats.")
+    else:
+        figure = px.line(
+            selected_demand, x="year", y="persons_with_need", color="department",
+            labels={"year": "Année", "persons_with_need": "Personnes avec besoin projeté", "department": "Département"},
+            title=filtered_demand["label"].iloc[0],
+        )
+        figure.update_layout(legend_title_text="Département", hovermode="x unified")
+        st.plotly_chart(figure, width="stretch")
+        display_years = [2026, 2030, 2040, 2050, 2060, 2070]
+        display = selected_demand.loc[selected_demand["year"].isin(display_years), ["department", "year", "population_at_risk", "prevalence", "persons_with_need"]].copy()
+        display["population_at_risk"] = display["population_at_risk"].round().astype(int)
+        display["prevalence"] = (100 * display["prevalence"]).round(2)
+        display["persons_with_need"] = display["persons_with_need"].round().astype(int)
+        st.dataframe(display.rename(columns={"department": "Département", "year": "Année", "population_at_risk": "Population concernée", "prevalence": "Prévalence (%)", "persons_with_need": "Personnes avec besoin"}), hide_index=True, width="stretch")
+    with st.expander("Périmètre et limites"):
+        st.markdown(
+            "Les résultats estiment des personnes avec besoin potentiel : population projetée × prévalence. "
+            "Ils ne mesurent ni des recours observés, ni le nombre de psychiatres requis. "
+            "L'indicateur « Besoin total » additionne dépression et anxiété selon l'hypothèse explicite qu'aucune personne n'est concernée par les deux ; il peut donc surestimer le besoin si cette hypothèse est fausse. "
+            "Le modèle n'utilise aucune donnée SNDS, PMSI, ATIH ou d'activité de soins. "
+            "Les 6–11 ans sont couverts par Enabee 2022 : 13 % présentent au moins un trouble probable parmi les troubles étudiés. "
+            "Ce taux, mesuré chez les enfants scolarisés en élémentaire en France hexagonale, est extrapolé à la population projetée des 6–11 ans. "
+            "Les moins de 6 ans, les 12–17 ans, les 80 ans et plus, les addictions et les troubles sévères adultes restent hors périmètre. "
+            "Le cumul dépression + anxiété concerne uniquement les adultes de 18–79 ans ; il n’inclut pas les enfants."
+        )
+
+
 def main():
     st.set_page_config(page_title="Projections psychiatres", layout="wide")
     st.title("Projections des effectifs de psychiatres par département")
@@ -1336,7 +1458,7 @@ def main():
         indicator = st.selectbox("Indicateur", list(INDICATORS.values()))
         scenario = st.selectbox("Scénario", sorted(df.scenario.unique()))
         year = st.slider("Année", int(df.annee.min()), int(df.annee.max()), anchor)
-    tab_map, tab_trends, tab_status, tab_internat, tab_mobility, tab_method = st.tabs(["Carte et effectifs", "Dynamiques départementales", "Statuts d’exercice", "Internat national", "Diplômes et installations", "Calibration et hypothèses"])
+    tab_map, tab_trends, tab_status, tab_internat, tab_mobility, tab_demand, tab_method = st.tabs(["Carte et effectifs", "Dynamiques départementales", "Statuts d’exercice", "Internat national", "Diplômes et installations", "Demande de soins", "Calibration et hypothèses"])
     names = context["baseline"].set_index("dep").nom.to_dict()
     with tab_map:
         selected = df[(df.indicateur == indicator) & (df.scenario == scenario) & (df.annee == year)].copy()
@@ -1494,6 +1616,8 @@ def main():
         st.caption("Un écart négatif signifie moins d'arrivées que dans le scénario à flux constant de référence, pas un nombre négatif d'installations. La référence 2026 est une convention de scénario supplémentaire ; le flux étranger exactement intégré dans la DREES n'est pas isolé ici.")
         if state["foreign_trend_limited_rows"]:
             st.warning("L’écart cumulé aurait rendu certains effectifs départementaux négatifs. Leur correction a été limitée à un effectif nul ; la décomposition montre le retrait effectivement appliqué.")
+    with tab_demand:
+        render_demand_tab()
     with tab_method:
         first = proposed["formation"]["rentree"] + proposed["formation"]["delai"]
         st.write(f"Places en deuxième année : hausse annuelle permanente à partir de {proposed['formation']['rentree']}, avec premiers effets en {first}. Délai validé : {proposed['formation']['delai']} ans. Le défaut de dix ans correspond à cinq ans avant le DES et cinq ans de DES.")

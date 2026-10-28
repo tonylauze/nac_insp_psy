@@ -11,17 +11,35 @@ classeurs Insee Omphale présents ici.
 - **Paramètres épidémiologiques** : `prevalence_parameters.csv`. Les valeurs
   initiales correspondent au Baromètre Santé publique France 2024 : épisode
   dépressif caractérisé sur douze mois (18,2 % des femmes et 12,8 % des hommes)
-  et trouble anxieux généralisé (6,3 % des 18-79 ans).
+  et trouble anxieux généralisé (6,3 % des 18-79 ans). Il inclut aussi, pour
+  les enfants de 6 à 11 ans, l'indicateur « au moins un trouble probable de
+  santé mentale » (13,0 %, étude Enabee 2022). Cet indicateur est déjà une
+  mesure tous troubles confondus et ne doit pas être additionné à ses
+  composantes (trouble émotionnel, trouble oppositionnel, TDAH probable).
 
 Sources :
 
 - https://www.insee.fr/fr/statistiques/7747107
 - https://www.santepubliquefrance.fr/sante-mentale/donnees
+- https://www.santepubliquefrance.fr/sante-mentale/depression-et-anxiete/enquetesetudes/premiers-resultats-de-letude-enabee-sur-le-bien-etre-et-la-sante-mentale-des-enfants-de-6-a-11-ans
 
-Les indicateurs ne sont **pas additionnés** : dépression et anxiété peuvent
-concerner une même personne. Les paramètres actuels ne couvrent pas les moins
-de 18 ans ni les 80 ans et plus ; ces populations ne doivent pas être
-interprétées comme sans besoin. Elles attendent des paramètres sourcés dédiés.
+Les sorties du moteur gardent les indicateurs séparés. Dans `app.py`, un cumul
+dépression + anxiété est proposé pour les 18–79 ans sous l'hypothèse explicite
+d'absence de recouvrement. Il ne comprend pas les enfants. La population adulte
+n'est comptée qu'une fois dans son dénominateur et les deux composantes doivent
+être présentes pour chaque département, année et scénario.
+
+Le modèle couvre désormais les 6-11 ans par un
+indicateur global ; les moins de 6 ans, les 12-17 ans et les 80 ans et plus attendent des paramètres
+sourcés dédiés. Leur absence ne doit pas être interprétée comme une absence de
+besoin.
+
+Enabee porte sur les enfants scolarisés en élémentaire en France hexagonale.
+Appliquer son taux national à tous les 6–11 ans projetés, y compris aux
+territoires ultramarins, est une hypothèse d'extrapolation. Les tranches d'âge
+quinquennales Omphale sont proratisées en supposant une distribution uniforme
+à l'intérieur de chaque tranche. Les scénarios de besoin sont également
+appliqués aux enfants ; ce sont des hypothèses exploratoires ancrées en 2026.
 
 ## Scénarios
 
@@ -43,6 +61,12 @@ prévu pour des hypothèses documentées à partir d'indicateurs publics de
 contexte ; il ne doit pas être calibré à partir de l'activité de soins.
 
 ## Exécution
+
+L'onglet « Demande de soins » de `app.py` utilise les sorties locales lorsqu'elles
+sont plus récentes que les sources. À défaut, il calcule les résultats en mémoire
+à partir des fichiers versionnés, avec cache. Il fonctionne donc après un clone
+sans avoir à versionner le dossier `output/`. La commande ci-dessous reste
+disponible pour exporter les résultats en CSV.
 
 Depuis la racine du dépôt :
 

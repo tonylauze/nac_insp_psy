@@ -26,6 +26,22 @@ Aucun fichier `projections.csv` n'est requis, lu ou créé. Aucun résultat fict
 
 ## 2. Structure, périodes et champ
 
+### Demande de soins
+
+L'onglet « Demande de soins » utilise `demand_projection/` et `dataDemand/`,
+qui doivent également être présents dans le déploiement. Il propose les
+indicateurs dépression et anxiété des 18–79 ans, leur cumul sous hypothèse
+d'absence de recouvrement, ainsi que « Enfant (6-11) : trouble probable (Enabee) ».
+Ce cumul adulte n'inclut pas les enfants. Les filtres de demande sont indépendants
+des paramètres de l'offre ; aucune conversion en nombre de psychiatres requis
+n'est effectuée.
+
+Les CSV locaux à jour sont lus lorsqu'ils existent. Sinon, le calcul est réalisé
+en mémoire et mis en cache à partir des sources versionnées ; les exports ne
+sont pas nécessaires au déploiement. Voir [les sources et limites](dataDemand/README.md).
+
+### Offre
+
 Le DataFrame public conserve strictement ces cinq colonnes, dans cet ordre :
 
 | Colonne | Contenu |
