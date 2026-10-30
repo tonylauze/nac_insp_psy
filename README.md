@@ -1,6 +1,10 @@
 # Projections de psychiatres par département
 
-Application Streamlit contenue dans **un seul `app.py`**. Les deux classeurs sont lus par le code ; les projections et les scénarios sont calculés **en mémoire, sans écriture de résultats sur le serveur**. La projection combine les dynamiques départementales, une correction nationale des arrivées, une répartition annuelle diplôme/exercice, les ouvertures régionales de formation, la tendance nationale des arrivées de diplômés à l’étranger et leur hausse supplémentaire, puis une répartition entre salariés et libéraux. Les dynamiques départementales et la correction de l'internat sont activées par défaut, et désactivables pour comparaison. Les curseurs de hausse de places et d’arrivées étrangères sont initialement nuls ; **la tendance des arrivées étrangères reste active à 0 %**, avec un ajustement nul en 2026. Le taux de retraite utilisé pour inférer les installations est réglable.
+Application Streamlit pilotée par **`app.py`**, avec les modules `demand_projection/` pour la demande de soins. Les deux classeurs sont lus par le code ; les projections et les scénarios sont calculés **en mémoire, sans écriture de résultats sur le serveur**. La projection combine les dynamiques départementales, une correction nationale des arrivées, une répartition annuelle diplôme/exercice, les ouvertures régionales de formation, la tendance nationale des arrivées de diplômés à l’étranger et leur hausse supplémentaire, puis une répartition entre salariés et libéraux. Les dynamiques départementales et la correction de l'internat sont activées par défaut, et désactivables pour comparaison. Les curseurs de hausse de places et d’arrivées étrangères sont initialement nuls ; **la tendance des arrivées étrangères reste active à 0 %**, avec un ajustement nul en 2026. Le taux de retraite utilisé pour inférer les installations est réglable.
+
+La projection démographique conserve les extrapolations de stocks. Les deux politiques publiques calculent séparément des pourcentages de destination et des volumes par lieu de diplôme à partir des installations historiques, puis les extrapolent. Le sélecteur de répartition par stocks agit seulement sur les pourcentages des cohortes supplémentaires.
+
+Le rapprochement offre/demande ajoute une capacité annuelle en actes, un besoin annuel en actes et un solde signé par habitant. Il utilise les effectifs du scénario validé et conserve séparément les hypothèses de demande et de productivité. Voir la section 12 pour les calculs, valeurs initiales et fichiers attendus.
 
 ## 1. Installation et fichiers
 
@@ -10,6 +14,7 @@ Placer dans le même dossier du dépôt GitHub :
 - `requirements.txt` (inclut notamment `openpyxl>=3.1,<4`)
 - `Médecins RPPS 2012-2026.xlsx`
 - `DREES_projections_medecins_2026.xlsx`
+- `demand_projection/` et `dataDemand/` pour la demande et son rapprochement avec l’offre ; leur absence laisse les projections d’effectifs accessibles.
 
 Les noms des classeurs doivent correspondre exactement aux constantes `RPPS_PATH` et `DREES_PATH`. Pour les ranger ailleurs, adapter ces constantes dans `app.py`. Un pointeur Git LFS non résolu n'est pas un classeur : les véritables octets Excel doivent être accessibles à l'application.
 
@@ -49,12 +54,14 @@ Le DataFrame public conserve strictement ces cinq colonnes, dans cet ordre :
 | `dep` | Code texte, zéros initiaux conservés, y compris `2A` et `2B` |
 | `annee` | Année entière |
 | `scenario` | Scénario DREES |
-| `indicateur` | `Effectif de psychiatres`, `Part de salariés`, `Nombre brut de libéraux` ou `Nombre brut de salariés` |
-| `valeur` | Effectif réel non négatif, ou part de salariés exprimée en pourcentage entre 0 et 100 |
+| `indicateur` | Les quatre indicateurs d’effectifs/statut ; quatre indicateurs d’activité et de rapprochement s’y ajoutent lorsque les données requises sont disponibles (section 12) |
+| `valeur` | Effectif ou actes non négatifs, part de salariés entre 0 et 100 %, ou **solde d’actes signé par habitant et par an** |
 
 Chaque combinaison département × année × scénario × indicateur est unique. Les variables de calibration restent dans des tables internes ; elles n'ajoutent aucune colonne à cette structure publique.
 
-Avec les fichiers fournis : **96 départements métropolitains**, observations **2012–2026**, projections **2027–2070**, quatre scénarios DREES et quatre indicateurs, soit **90 624 lignes**. Les observations sont répétées à l'identique dans chaque scénario. **2026 est observé**, sans double ligne projetée. L'ancrage `b` est détecté comme la dernière année du classeur historique ; la borne finale dépend des projections disponibles.
+Avec les fichiers fournis : **96 départements métropolitains**, observations **2012–2026**, projections **2027–2070**, quatre scénarios DREES et quatre indicateurs d’effectifs/statut, soit **90 624 lignes d’offre**. Les observations sont répétées à l'identique dans chaque scénario. **2026 est observé**, sans double ligne projetée. L'ancrage `b` est détecté comme la dernière année du classeur historique ; la borne finale dépend des projections disponibles.
+
+Le rapprochement garde les mêmes cinq colonnes publiques. Avec une demande et une population complètes sur 2026–2070, ses quatre indicateurs ajoutent **69 120 lignes**, soit **159 744 lignes** au total. Le champ commun et la disponibilité des données déterminent ce nombre ; aucune ligne de rapprochement n’est inventée pour 2012–2025.
 
 Le RPPS porte sur tous les âges, sexes et modes d'exercice. Le classeur DREES déclare pour les médecins actifs un champ de **70 ans ou moins** ; les étudiants de troisième cycle constituent un statut distinct. Ces champs ne sont pas identiques. Les effectifs sont des personnes, pas des équivalents temps plein.
 
@@ -144,181 +151,171 @@ dynamique[d,t,s] = f(brut[d,t,s]) × B[t,s] / somme_d f(brut[d,t,s])
 
 Si le total de référence est nul, les effectifs sont nuls. Le total national est donc conservé **à l'étape des dynamiques**. La correction de l'internat peut ensuite le réduire, la tendance des arrivées étrangères le modifier dans les deux sens, puis les hausses d'arrivées et les places supplémentaires l'augmenter. Cette renormalisation implique qu'après activation du plancher, les trajectoires finales ne sont plus strictement linéaires, même pour les autres départements. Les observations, dont 2026, ne sont jamais lissées ni modifiées.
 
-## 5. Installations, places en deuxième année et diplômés à l'étranger
+## 5. Projections démographiques et simulations de politiques publiques
 
-### Paramètres validés
+Les deux calculs sont séparés. La trajectoire démographique conserve l'extrapolation des stocks ; les curseurs d'ouverture de places et d'augmentation des flux migratoires utilisent des installations reconstituées sur les observations. **À curseurs nuls, les résultats sont identiques à ceux de la version fusionnée précédente**, avec la méthode démographique initiale. Le choix de répartition des politiques publiques ne modifie jamais cette trajectoire.
 
-| Paramètre | Défaut | Effet |
+### Paramètres et sources
+
+| Paramètre | Valeur initiale | Fonction |
 | --- | --- | --- |
-| Méthode de répartition | Installations estimées (delta + retraites) | Utiliser les installations reconstituées, ou directement les parts des effectifs projetés |
-| Taux annuel uniforme de retraite | 3 % | Hypothèse modifiable entre 0 et 20 %, par pas de 0,1 point ; identique pour toutes les origines et destinations |
-| Première année d'estimation diplôme/exercice | 2012 | Régressions jusqu'en 2026, avec au moins cinq années |
-| Hausses régionales de places | 0 % | De 0 à 100 %, reconduites pour chaque cohorte de deuxième année |
-| Première rentrée augmentée en deuxième année | 2027 | Année de départ des cohortes concernées |
-| Délai deuxième année → installation | 10 ans | Modifiable de 5 à 20 ans ; la première installation doit rester dans l'horizon disponible |
-| Hausse du flux de diplômés à l'étranger, code 99 | 0 % | De 0 à 100 %, appliquée chaque année, sans délai de formation |
-| Première année de hausse du flux étranger | 2027 | Premiers effets cette même année |
+| Répartition des nouveaux arrivants | Installations estimées (delta + retraites) | Extrapolation des proportions historiques d'installations ; option alternative fondée sur les stocks |
+| Taux annuel uniforme de retraite | 3 % | Hypothèse réglable entre 0 et 20 %, commune aux origines et destinations |
+| Première année d'estimation | 2012 | Stocks à partir de 2012 ; installations disponibles à partir de 2013 |
+| Hausse de places par région de diplôme | 0 % | De 0 à 100 %, maintenue pour chaque cohorte suivante |
+| Première rentrée augmentée en deuxième année | 2027 | Année d'entrée de la première cohorte supplémentaire |
+| Délai deuxième année → installation | 10 ans | Réglable entre 5 et 20 ans ; premiers effets en 2037 par défaut |
+| Hausse des arrivées de diplômés à l'étranger | 0 % | De 0 à 100 %, maintenue chaque année, sans délai de formation |
+| Première année de hausse du flux étranger | 2027 | Premiers effets la même année |
 
-Le taux de retraite de 3 % est un **paramètre illustratif, non estimé dans les sources**. Il sert à reconstituer un flux à partir des stocks. Il n'est pas soustrait une seconde fois à la référence DREES et ne modifie pas directement ses hypothèses de retraite. Les variations de ce taux modifient les installations inférées, donc leur répartition, ainsi que le volume étranger estimé. En mode de répartition par les effectifs projetés, il n'affecte pas les proportions mais continue d'affecter le volume du flux étranger.
+Le lecteur utilise toutes les colonnes **2012–2026** de l'onglet **`Effectifs par lieu diplome`**, pour Psychiatrie. La source donne la région de diplôme et la région d'exercice, sans âge ni année individuelle de diplôme. Les marges « Ensemble » servent aux contrôles ; elles ne sont pas additionnées au détail. Les cellules absentes ne sont complétées par zéro qu'après vérification des marges. Les doublons, valeurs manquantes ou négatives sont rejetés.
 
-### Historique complet par origine de diplôme et destination d'exercice
+Il existe 15 origines : 12 régions métropolitaines de formation, Antilles-Guyane (`01`), région inconnue (`98`) et étranger (`99`). Les 12 origines métropolitaines disponibles alimentent les curseurs de formation. La Corse ne dispose pas d'une origine de diplôme calibrée dans cette source ; son curseur reste désactivé, mais elle peut recevoir des diplômés d'autres origines. Les codes `01` et `98` sont inspectables sans alimenter de curseur. **Le code 99 d'origine désigne le lieu du diplôme, pas la nationalité.** Il ne doit pas être confondu avec la destination `99-COM ou étranger`.
 
-Le lecteur exploite toutes les colonnes annuelles **2012–2026** de l'onglet **`Effectifs par lieu diplome`**, pour Psychiatrie. Le tableau fourni contient les régions de diplôme et les régions d'exercice, sans ventilation par âge ou année individuelle de diplôme. Les totaux « Ensemble » servent uniquement au contrôle des marges. Pour chaque origine et année, la somme des destinations doit retrouver le total publié ; les cellules absentes peuvent être complétées par zéro uniquement après ce contrôle. Les doublons, valeurs manquantes et valeurs négatives sont rejetés.
+Pour les politiques publiques, tous les volumes et proportions portent sur les régions d'exercice françaises, **DROM inclus**, en excluant la destination `99-COM ou étranger`, dont le champ ne peut pas être isolé. Les parts ultramarines restent au dénominateur et ne sont pas réaffectées à la métropole.
 
-Les sources actuelles donnent 15 origines, dont 12 régions métropolitaines de formation, Antilles-Guyane (`01`), région inconnue (`98`) et étranger (`99`). Toutes sont extrapolées pour permettre l'inspection. Le code `98` n'est pas fusionné avec `99` et n'alimente aucun curseur. Les destinations hors métropole restent dans la normalisation des proportions ; pour l'origine étrangère, le calcul national conditionne ensuite ces proportions aux destinations françaises, comme décrit plus bas. **Le code 99 d'origine désigne le lieu du diplôme, pas la nationalité ; le code 99 de destination est une autre variable.**
+### A. Trajectoire démographique : extrapolation des stocks conservée
 
-Pour l'origine `o`, la région d'exercice `j` et l'année `t`, on note `N[o,j,t]` l'effectif. Une régression linéaire avec constante sur la fenêtre validée estime une pente `beta[o,j]`, en personnes par an. La projection est raccordée au dernier compte réel `b=2026` :
-
-```text
-N_proj[o,j,t] = max(0, N[o,j,b] + beta[o,j] × (t-b))
-```
-
-Chaque cellule est extrapolée séparément, sans modifier les comptes observés. Le plancher empêche les effectifs négatifs. Cette projection des cellules n'est pas renormalisée au total national DREES : elle sert à estimer les répartitions d'installation et les flux du code 99. Le total général de l'application conserve la référence DREES et les dynamiques départementales décrites plus haut.
-
-### Deux méthodes de répartition, année par année
-
-**Méthode 1 — installations estimées.** À partir des comptes extrapolés et du taux de retraite `r` :
+Pour chaque origine de diplôme `o` et région d'exercice `j`, une régression linéaire sur les effectifs historiques estime une pente `beta_N[o,j]`. La projection reste raccordée au compte réel de `b=2026` :
 
 ```text
-I_brut[o,j,t] = N_proj[o,j,t] - (1-r) × N_proj[o,j,t-1]
-I[o,j,t] = max(0, I_brut[o,j,t])
-P[j|o,t] = I[o,j,t] / somme_destinations I[o,destination,t]
+N_proj[o,j,t] = max(0, N[o,j,b] + beta_N[o,j] × (t-b))
+D[o,j,t] = max(0, N_proj[o,j,t] - (1-r) × N_proj[o,j,t-1])
 ```
 
-Pour la première projection (2027), l'effectif précédent est le compte réel de 2026. Le diagnostic à l'ancrage utilise les comptes réels de 2026 et 2025. Aucune installation négative n'est conservée. Le dénominateur inclut toutes les destinations, pas seulement celles affichées sur la carte métropolitaine.
+L'effectif précédent de 2027 est le compte réel de 2026. Le diagnostic de 2026 utilise 2025. Ces stocks et les flux qui en sont déduits après extrapolation conservent leur rôle dans la correction nationale de l'internat et dans la tendance démographique étrangère. Leur calcul est indépendant du sélecteur de répartition des politiques publiques.
 
-**Méthode 2 — répartition des effectifs projetés.** Les proportions n'utilisent pas le delta :
+Le total général reste issu de la projection DREES raccordée aux observations, avec les dynamiques départementales et la correction nationale décrites ailleurs. Il n'est pas reconstruit à partir des nouveaux flux de simulation.
+
+### B. Politiques publiques : extrapolation des pourcentages historiques
+
+Pour chaque couple origine de diplôme / région d'exercice, **on calcule d'abord les installations sur les stocks réellement observés**, et non sur les stocks projetés :
 
 ```text
-P[j|o,t] = N_proj[o,j,t] / somme_destinations N_proj[o,destination,t]
+I_hist[o,j,t] = max(0, N_obs[o,j,t] - (1-r) × N_obs[o,j,t-1])
+p_hist[j|o,t] = I_hist[o,j,t] / somme_regions_francaises_k I_hist[o,k,t]
 ```
 
-En méthode 1, si tous les flux d'une origine sont nuls, on utilise les parts des effectifs projetés. Si tous les effectifs projetés sont eux-mêmes nuls, on utilise les parts observées en 2026. En méthode 2, ce dernier repli s'applique également. L'interface signale le recours à ces règles. Une origine sans effectif à l'ancrage et sans calibration n'est pas dotée arbitrairement d'une répartition.
+L'historique des installations commence en **2013**, faute de stock 2011 pour calculer le delta 2012. Par défaut, les proportions sont ajustées sur 2013–2026. Si la fenêtre est déplacée à 2019, les installations de 2019 utilisent aussi le compte de 2018, sans inclure 2018 dans la régression. Au moins cinq années sont requises.
 
-Cette reconstitution suppose que les sorties sont approchées par `r × N_précédent`. **Elle n'identifie pas directement les premières installations** : les changements de région en cours de carrière, les cessations hors retraite, les décès et les changements de champ peuvent également expliquer les variations de stocks. Pour les proportions territoriales, le maximum est pris cellule par cellule ; sa somme peut dépasser le maximum du delta agrégé, notamment lors de mobilités entre régions. **Le volume national étranger est désormais calculé séparément, en appliquant le maximum après agrégation**, pour éviter de compter ces mouvements internes comme des arrivées nationales.
-
-### Volume des diplômés formés en France
-
-Le nouveau calcul détermine la répartition géographique. Le volume national reste calibré sur le statut **Étudiants en 3ème cycle** en Psychiatrie dans `Effectif par spécialité` :
+Une régression linéaire avec constante et poids égaux par année est ajustée **sur les proportions historiques** de chaque couple. Sa pente `gamma[o,j]` est prolongée depuis la dernière proportion reconstituée en 2026 :
 
 ```text
-F_reference[t,s] = S_psy[t,s] / 5
-F_corrige[t,s] = F_reference[t,s] × c[t-5]
+p_brut[j|o,t] = p_hist[j|o,b] + gamma[o,j] × (t-b)
+p_borne[j|o,t] = min(1, max(0, p_brut[j|o,t]))
+P[j|o,t] = p_borne[j|o,t] / somme_regions_francaises_k p_borne[k|o,t]
 ```
 
-`S_psy` est le stock d'internes de l'année d'arrivée ; sa division par cinq approche un flux annuel de sortie, sous hypothèse de cohortes équilibrées. Elle ne reconstitue pas exactement les sorties lorsque les tailles de cohortes ou durées changent. Le coefficient de postes non pourvus est celui de l'entrée en internat, cinq ans plus tôt ; il vaut 1 lorsque la correction est désactivée. Sa définition figure en section 10. Il ne s'applique pas aux diplômés à l'étranger.
+Les proportions sont donc bornées à 0–100 %, puis renormalisées ensemble pour totaliser 100 % pour chaque origine et chaque année. Le bornage peut modifier la pente finale et la renormalisation peut ramener sous 100 % une proportion individuellement plafonnée à 100 %. Le point 2026 reste raccordé exactement. **La méthode n'est ni une moyenne des répartitions historiques, ni une extrapolation des stocks suivie d'un delta, ni le ratio de flux régionaux extrapolés séparément.**
 
-Faute d'effectifs régionaux d'internes spécialisés en psychiatrie dans les tables exploitées, les poids régionaux de formation restent ceux des stocks DREES d'internes **toutes spécialités** à l'ancrage :
+Lorsque toutes les installations historiques d'une origine sont nulles une année, ses proportions utilisent les stocks observés de cette année. Pour une projection sans proportion disponible, on utilise les stocks projetés ; si tous ces stocks sont nuls, les parts de 2026 servent de repli. Les règles sont affichées.
+
+### C. Politiques publiques : extrapolation séparée des volumes par origine
+
+Le volume est calculé séparément, avec la même idée de delta corrigé des retraites, **appliquée après agrégation des stocks observés sur les régions françaises** :
 
 ```text
-w[o,s] = S_tous_region[o,b,s] / S_tous_France[b,s]
-F_origine[o,t,s] = w[o,s] × F_corrige[t,s]
+T_obs[o,t] = somme_regions_francaises_j N_obs[o,j,t]
+F_hist[o,t] = max(0, T_obs[o,t] - (1-r) × T_obs[o,t-1])
 ```
 
-Les poids sont propres au scénario et fixes dans le temps. Les anciennes régions DREES sont regroupées en régions actuelles. Le dénominateur est France entière ; les seules régions métropolitaines ne sont pas renormalisées à 100 %. Le ratio des stocks Psychiatrie/Ensemble n'est pas traité comme une probabilité individuelle de spécialisation, car les durées de DES diffèrent.
+On ajuste une régression linéaire de `F_hist` sur la même fenêtre historique que les proportions. Sa pente `beta_F[o]` est prolongée depuis le flux reconstitué en 2026 :
 
-Cette calibration maintient l'hypothèse qu'une hausse relative de places de deuxième année se transmet proportionnellement au flux futur de psychiatres : élasticité de 1, composition en spécialités et réussite inchangées. Les effectifs historiques par lieu de diplôme servent à prévoir **où** s'installera chaque cohorte, sans remplacer le volume DREES français par la somme des deltas.
+```text
+F_politique[o,t] = max(0, F_hist[o,b] + beta_F[o] × (t-b))
+Arrivees_reparties[o,j,t] = F_politique[o,t] × P[j|o,t]
+```
 
-### Délai, routage annuel et cumul
+**Cette règle vaut pour les deux politiques : ouverture de places et hausse des flux migratoires.** Le volume des cohortes supplémentaires françaises ne provient plus du stock DREES d'internes divisé par cinq ni des poids régionaux d'internes toutes spécialités. Ces anciennes calibrations restent utilisées uniquement pour la correction nationale de la trajectoire démographique, afin de la conserver.
 
-La rentrée désigne désormais **la deuxième année**, et non l'année du bac. Le délai initial de dix ans correspond à cinq ans restant avant le DES, puis cinq ans de DES. Il est réglable et ne constitue pas une durée moyenne empirique. Une rentrée augmentée en **2027** produit donc ses premiers effets en **2037** avec le réglage initial. Le délai de cinq ans du DES employé pour le coefficient de non-remplissage reste distinct et fixe.
+Le maximum est pris après agrégation pour le volume : la somme des deltas régionaux positifs pourrait compter des mobilités internes comme de nouvelles arrivées nationales. Le volume national n'est donc pas nécessairement égal à la somme des `I_hist` régionaux utilisés pour les proportions. Les deux estimations sont combinées explicitement par multiplication. Les flux par origine sont identiques dans les quatre scénarios DREES pour des paramètres identiques.
 
-Sources sur le parcours consultées le 23 octobre 2026 : [Onisep](https://www.onisep.fr/formation/les-principaux-domaines-de-formation/les-etudes-de-sante/les-etudes-de-medecine) ; [maquette du DES de psychiatrie, dix semestres](https://www.legifrance.gouv.fr/loda/article_lc/LEGIARTI000047115341/2026-07-25). Les interruptions, redoublements et changements de région en cours d'études ne sont pas simulés séparément. On assimile région d'ouverture des places et région de diplôme.
+### D. Option de répartition fondée sur les stocks
 
-À l'intérieur de la région d'exercice, la part du département est maintenue à son niveau de 2026 :
+Le sélecteur permet d'utiliser les proportions des stocks extrapolés à la place des proportions d'installations :
+
+```text
+P_stock[j|o,t] = N_proj[o,j,t] / somme_regions_francaises_k N_proj[o,k,t]
+```
+
+Cette option change **uniquement les proportions de destination des cohortes supplémentaires**. Les volumes `F_politique[o,t]` continuent d'être calculés à partir des installations historiques. Elle ne modifie ni la trajectoire démographique, ni la correction nationale de l'internat, ni la composante étrangère active à curseur nul. Les parts de 2026 servent de repli si le stock projeté d'une origine devient nul.
+
+### E. Répartition départementale, délais et cumul
+
+La source diplôme/exercice étant régionale, les proportions départementales utilisent toujours les poids observés en 2026 à l'intérieur de la région d'exercice :
 
 ```text
 q[d|j] = Effectif[d,b] / somme_departements_de_j Effectif[d,b]
 R[d|o,t] = P[region(d)|o,t] × q[d|region(d)]
 ```
 
-Pour une hausse régionale `u[o]` en pourcentage et une première arrivée `g = rentrée + délai` :
+Il s'agit donc d'une évolution estimée au niveau régional, puis ventilée entre départements ; on n'estime pas de mobilités départementales absentes de la source. Les proportions des 96 départements métropolitains peuvent sommer à moins de 100 %, puisque les destinations ultramarines sont conservées.
+
+Pour une hausse de places `u[o]` et une première arrivée `g = rentrée + délai` :
 
 ```text
-Ajout_annuel[d,t,s] = somme_origines_o (u[o]/100) × F_origine[o,t,s] × R[d|o,t]   si t >= g
-Ajout_places[d,T,s] = somme_t=g..T Ajout_annuel[d,t,s]
+Flux_places[o,t] = (u[o]/100) × F_politique[o,t] × c[t-5]       si t >= g
+Ajout_places[d,T] = somme_t=g..T somme_origines_o Flux_places[o,t] × R[d|o,t]
 ```
 
-**Chaque cohorte utilise la répartition de son année d'arrivée, puis est cumulée.** Les cohortes déjà arrivées ne sont pas redistribuées selon la matrice des années suivantes. La hausse des places est permanente pour les cohortes suivantes ; +100 % signifie doubler chaque cohorte de référence, sans doublement exponentiel d'une année sur l'autre. Le coefficient de postes vacants n'est appliqué qu'une fois, avant le cumul.
+Le coefficient des postes vacants `c` est appliqué une seule fois aux flux français, avant leur répartition et leur cumul. Il vaut 1 si la correction est désactivée. La hausse de places est maintenue pour chaque cohorte suivante, avec une élasticité supposée de 1 entre hausse relative des places et hausse relative des installations. Ce n'est pas un doublement exponentiel année après année.
 
-Les cohortes supplémentaires restent cumulées sans attrition ni retraite supplémentaire jusqu'en 2070, conformément à l'hypothèse de cumul du modèle. Le taux de retraite macro sert à inférer les installations dans la matrice ; il ne constitue pas ici un modèle de survie des nouvelles cohortes. Cette simplification peut majorer les effets aux horizons lointains. Les ajouts ne sont ni multipliés par le facteur de raccord RPPS/DREES, ni effacés par une renormalisation ultérieure.
+La rentrée désigne la **deuxième année**. Le délai initial de dix ans correspond à cinq ans avant le DES, puis cinq ans de DES ; il est réglable et ne constitue pas une durée moyenne empirique. Une rentrée augmentée en **2027** produit ses premiers effets en **2037**. Sources de parcours consultées le 23 octobre 2026 : [Onisep](https://www.onisep.fr/formation/les-principaux-domaines-de-formation/les-etudes-de-sante/les-etudes-de-medecine) ; [DES de psychiatrie, dix semestres](https://www.legifrance.gouv.fr/loda/article_lc/LEGIARTI000047115341/2026-07-25). Les interruptions et redoublements ne sont pas simulés séparément ; la région d'ouverture de places est assimilée à la région de diplôme.
 
-Le tableau de calibration donne pour +1 % dans une origine, à la première année d'installation `g` :
+Pour une hausse `v` du flux migratoire, active à partir de `h` :
 
 ```text
-Delta_metro[o,g,s] = 0,01 × F_origine[o,g,s] × somme_departements_metro R[d|o,g]
-X[o,g,s] (%) = 100 × Delta_metro[o,g,s] / B_corrige[g,s]
+Flux_migration[t] = (v/100) × F_politique[99,t]                 si t >= h
+Ajout_migration[d,T] = somme_t=h..T Flux_migration[t] × R[d|99,t]
 ```
 
-`B_corrige` est le total après correction de l'internat, avant la tendance des arrivées étrangères et les hausses de places ou d'arrivées. X dépend de l'origine, de la méthode, du taux de retraite, de l'année et du scénario. La Corse n'a pas de calibration d'origine de formation exploitable dans ces sources : son curseur reste désactivé. Elle peut recevoir des diplômés des autres origines. Une création ex nihilo demanderait un nombre absolu de places et des hypothèses supplémentaires.
+Aucun délai de formation ni coefficient de postes vacants français n'est appliqué aux arrivées étrangères. Chaque cohorte utilise la répartition de son année d'arrivée ; les cohortes antérieures ne sont jamais redistribuées. Les ajouts des deux politiques sont cumulés sans attrition ni retraite supplémentaire, comme précédemment. Le taux macro sert à reconstituer les installations historiques ; il ne constitue pas un modèle de survie des cohortes ajoutées.
 
-### Code 99 : tendance nationale ancrée en 2026 et hausse supplémentaire
+Le tableau de calibration donne l'effet de +1 % de places à la première année d'installation, à partir du flux d'origine corrigé et de la part de destination métropolitaine. Son ratio `X` utilise comme dénominateur le total DREES après correction de l'internat, avant tendance étrangère et hausses. Le flux supplémentaire absolu est commun aux scénarios ; ce ratio dépend du total de chaque scénario.
 
-Les comptes par région d'exercice des diplômés à l'étranger sont extrapolés comme les autres origines. On les agrège ensuite sur les régions d'exercice françaises, **DROM inclus**, pour obtenir le total national `T[t]`. La destination `99-COM ou étranger`, qui ne permet pas d'isoler une région française, est exclue de ce calcul. Son effectif est nul dans la série étrangère fournie. Le flux annuel est obtenu en appliquant le maximum **une seule fois au total national** :
+### F. Code 99 : composante démographique conservée, distincte du curseur
+
+La tendance active même à curseur nul conserve la projection des stocks du code 99, agrégée sur les régions d'exercice françaises :
 
 ```text
-T[t] = somme_regions_francaises_j N_proj[99,j,t]
-F_99[t] = max(0, T[t] - (1-r) × T[t-1])
-F_99[b] = max(0, T_observe[b] - (1-r) × T_observe[b-1])     avec b = 2026
+T_proj[t] = somme_regions_francaises_j N_proj[99,j,t]
+F_demo[t] = max(0, T_proj[t] - (1-r) × T_proj[t-1])
+F_demo[b] = max(0, T_obs[99,b] - (1-r) × T_obs[99,b-1])
+Delta_F_demo[t] = F_demo[t] - F_demo[b]                         si t > b
+Delta_F_demo[b] = 0
 ```
 
-Le flux de 2026 utilise donc les comptes réellement observés de 2026 et 2025, et non une différence entre deux niveaux ajustés. Les flux `F_99` sont toujours non négatifs. Le volume est identique dans les quatre scénarios DREES pour les mêmes paramètres, puisqu'il vient du même historique et du même taux macro. Le choix de méthode de répartition ne modifie pas ce volume.
+Son routage démographique reste celui des flux `D` déduits des stocks projetés, conditionné à la France, avec les mêmes replis qu'auparavant. Il n'utilise pas les nouveaux pourcentages des politiques publiques. L'ajustement cumule les écarts annuels au flux de 2026, et peut être négatif. Un retrait ne peut pas rendre un effectif départemental négatif ; une limitation éventuelle est signalée. Le curseur migratoire ajoute séparément son flux, selon les équations de la section E.
 
-**Même avec le curseur à 0 %, on ajoute désormais l'évolution du flux par rapport au niveau de 2026.** Le flux annuel supplémentaire de tendance est :
+Avec 3 % de retraite, le flux de référence 2026 vaut `2 068 − 0,97 × 1 999 = 128,97`. Le flux démographique issu des stocks atteint environ 148,210 en 2040. L'effet cumulé de tendance, à curseur nul, reste environ **+95,878 en métropole en 2040 et +1 479,228 en 2070**.
 
-```text
-Delta_F[t] = F_99[t] - F_99[b]                 si t > b
-Delta_F[b] = 0
-```
+Le flux utilisé par le curseur est désormais différent : la régression des installations historiques étrangères donne une pente d'environ **−3,569 installations par an** avec la fenêtre initiale. Raccordé à 128,97 en 2026, il vaut environ **125,401 en 2027**, **79,010 en 2040**, puis atteint le plancher zéro en **2063**. Il s'agit du résultat mécanique de cette hypothèse linéaire ; cela ne réduit pas la composante démographique conservée. L'interface présente les deux flux séparément.
 
-On cumule les écarts annuels au flux constant de référence : on ne cumule pas tous les `F_99[t]`, et on ne soustrait pas le stock `T[b]` à un flux. Cette distinction stock/flux conserve une référence cohérente. Un flux futur identique à celui de 2026 produit un ajustement nul, quelle que soit la durée de projection. **Un écart peut être négatif** lorsque le flux prévu est inférieur au flux de 2026 ; cela représente moins d'arrivées que dans la référence, pas un nombre négatif d'installations.
+### Limites d'interprétation
 
-Les proportions `P[j|99,t]` restent déterminées par la méthode sélectionnée (delta + retraites ou parts d'effectifs projetés). Comme le volume porte désormais explicitement sur la France, les proportions sont conditionnées à ce même champ :
+Le taux de retraite de 3 % est une hypothèse illustrative, non estimée dans ces sources. Les sorties hors retraite, décès, changements de champ et mobilités entre régions peuvent contribuer aux deltas. Les installations reconstituées ne sont donc pas des premières installations directement observées. Les différences annuelles et les petites cellules peuvent produire des proportions instables ; la fenêtre et le taux de retraite influencent les pentes. Les planchers et renormalisations garantissent des valeurs admissibles, pas la validité empirique des hypothèses.
 
-```text
-P_France[j|99,t] = P[j|99,t] / somme_regions_francaises_k P[k|99,t]
-R_France[d|99,t] = P_France[region(d)|99,t] × q[d|region(d)]
-```
+Le maintien du flux de 2026 dans la comparaison démographique étrangère reste une convention de scénario additionnel ; le flux étranger exactement incorporé aux projections DREES n'est pas identifié ici. Les ajouts ne sont ni effacés par une renormalisation nationale ultérieure, ni multipliés par le facteur de raccord RPPS/DREES.
 
-Si les parts françaises initiales somment à zéro, on utilise les parts des effectifs français projetés, puis celles de 2026 si nécessaire. Les destinations ultramarines restent au dénominateur : leur part n'est pas réaffectée aux départements métropolitains affichés. Le tableau et le graphique du code 99 affichent cette répartition conditionnelle à une installation en France.
-
-L'ajustement de tendance départemental est calculé en répartissant chaque écart annuel selon les proportions de son année, puis en cumulant :
-
-```text
-Ajustement_tendance[d,T] = somme_t=b+1..T Delta_F[t] × R_France[d|99,t]
-Ajustement_tendance[d,b] = 0
-```
-
-Le curseur de hausse est conservé comme simulation supplémentaire. Pour un pourcentage `u` et une première année choisie `g` :
-
-```text
-Hausse_annuelle[d,t] = (u/100) × F_99[t] × R_France[d|99,t]     si t >= g
-Ajout_curseur[d,T] = somme_t=g..T Hausse_annuelle[d,t]
-Effectif_apres_etranger[d,T] = max(0, Effectif_avant_etranger[d,T] + Ajustement_tendance[d,T])
-                             + Ajout_curseur[d,T]
-```
-
-Le changement de l'année de début du curseur n'affecte pas la tendance de base, qui commence toujours après 2026. Le curseur porte sur le flux annuel complet `F_99[t]`, pas seulement sur son écart à 2026. Aucun délai de formation ni coefficient de postes vacants français n'est appliqué. Les deux composantes sont présentées séparément dans la décomposition des effectifs. Si l'écart cumulé rendrait un effectif départemental négatif, son retrait est limité à ce stock, l'interface le signale et la décomposition affiche la correction effectivement appliquée.
-
-Ces écarts et hausses restent cumulés sans attrition des cohortes supplémentaires, comme les ouvertures de places. **Le scénario de comparaison à flux étranger constant au niveau de 2026 est une convention**, et non une identification du flux exact déjà inclus dans la DREES. La projection DREES reste la base ; on lui applique cette correction additionnelle. Le code 99 caractérise le lieu du diplôme, pas la nationalité, les visas ou des passages de frontière directement observés.
-
-Avec les sources actuelles et 3 % de retraite : `T[2025] = 1 999`, `T[2026] = 2 068`, donc `F_99[2026] = 128,97`. Le flux estimé vaut environ 124,033 en 2027, 148,210 en 2040 et 204,214 en 2070. Les écarts annuels à 2026 valent respectivement −4,937, +19,240 et +75,244. Avec la répartition par installations estimées et un curseur nul, l'effet cumulé en métropole vaut environ **−4,733 en 2027, −8,234 en 2030, +95,878 en 2040 et +1 479,228 en 2070**. Le plancher à zéro ne limite aucun de ces ajustements dans ce réglage initial.
 
 ## 6. Périmètre de calcul
 
-La version actuelle utilise les effectifs de psychiatres, leur répartition par statut, les stocks d'étudiants, la mobilité diplôme/exercice et les taux nationaux de postes non pourvus. Ces derniers sont intégrés au code avec leurs sources, sans fichier supplémentaire ni téléchargement de statistiques à l'exécution. Aucun fichier CSV n'est nécessaire. L'intégration de projections démographiques territoriales est reportée à une étape ultérieure et n'entre dans aucun calcul actuel.
+La version actuelle utilise les effectifs de psychiatres, leur répartition par statut, les stocks d'étudiants, la mobilité diplôme/exercice et les taux nationaux de postes non pourvus. Ces derniers sont intégrés au code avec leurs sources, sans fichier supplémentaire ni téléchargement de statistiques à l'exécution. Aucun CSV n’est nécessaire au moteur d’effectifs. La demande utilise les sources de `dataDemand/`. Le nouveau solde par habitant requiert la **population totale tous âges**, selon le scénario Insee sélectionné, en plus des populations à risque utilisées pour calculer le besoin. Il ne modifie pas les effectifs projetés.
 
 ## 7. Interface et graphique
 
 - « Valider » applique ensemble les paramètres du formulaire. Bouger un curseur ou cocher une case ne modifie pas à lui seul les résultats affichés. Les bandeaux indiquent les **paramètres effectivement validés**, et non une éventuelle saisie en attente.
 - L'état des dynamiques est désormais affiché explicitement : activées/désactivées, première année d'effet et fenêtre d'estimation. Si elles sont désactivées, le graphique avertit que la pente estimée n'est pas appliquée.
-- Les filtres indicateur/scénario/année pilotent la carte et le tableau ; leur utilisation ne relance pas la simulation. Les trois nouveaux indicateurs sont sélectionnables au même endroit que le total.
-- L'échelle de couleurs est fixe entre années pour chaque indicateur d'effectifs : quantiles 2 % et 98 % sur toutes les années et tous les scénarios de la simulation validée. Pour la part salariée, elle reste entre 0 et 100 %. Les valeurs hors bornes restent dans le tableau et au survol.
+- Les filtres indicateur/scénario/année pilotent la carte et le tableau ; leur utilisation ne relance pas la simulation. Les quatre indicateurs de rapprochement sont sélectionnables au même endroit que les quatre indicateurs d’effectifs/statut. Ils ne sont calculés que sur la période commune disponible.
+- « Valider l’offre / demande » applique séparément les paramètres du rapprochement. Les filtres de l’onglet « Demande de soins » ne les remplacent pas.
+- L'échelle de couleurs est fixe entre années pour chaque indicateur d'effectifs : quantiles 2 % et 98 % sur toutes les années et tous les scénarios de la simulation validée. Pour la part salariée, elle reste entre 0 et 100 %. Le solde d’actes utilise une palette divergente rouge/bleu, centrée sur zéro, avec des bornes symétriques au quantile 98 % de sa valeur absolue sur toute la période et tous les scénarios. Les valeurs hors bornes restent dans le tableau et au survol.
 - La carte conserve la projection conique conforme de Lambert, avec les parallèles 44° et 49°, un cadrage fixe incluant la Corse et le déplacement désactivé. Les anneaux des polygones GeoJSON sont orientés pour Plotly afin d'éviter un remplissage du globe. La palette bleue commence à une teinte visible sur le fond, les départements sont séparés par des contours blancs et les infobulles présentent le nom, le code et la valeur avec son unité.
 - L'onglet « Dynamiques départementales » compare un ou plusieurs départements sur toute la période. Le filtre Année de la carte ne tronque pas ces courbes.
 - L'onglet « Statuts d’exercice » montre les parts observées puis extrapolées et les deux comptes pour l'année sélectionnée.
-- L'onglet « Diplômes et installations » expose, pour chaque origine et année, les effectifs précédents et projetés, les installations non négatives, les proportions et les éventuelles règles de repli. Il permet aussi de suivre le flux estimé du code 99.
+- L'onglet « Diplômes et installations » expose les proportions utilisées par les politiques publiques, leurs pentes, les arrivées réparties et les règles de repli. Le graphique montre l'historique reconstitué en trait plein, la projection en tirets et une ligne de raccord en 2026, avec une couleur distincte par région. Les tableaux historiques permettent de vérifier les deltas ; le tableau du code 99 distingue le flux démographique issu des stocks et le flux extrapolé utilisé par le curseur.
 - L'onglet « Internat national » montre la série observée, sa prolongation linéaire et les flux par scénario avant/après correction, avec les sources et les limites de calibration.
+
+- L’onglet « Demande de soins » conserve les projections de besoin et leurs filtres indépendants. L’onglet « Offre / demande » expose les calculs, les courbes du solde, les totaux métropolitains et les hypothèses. L’application comporte huit onglets.
 
 ### Deux vues, une référence commune
 
@@ -351,7 +348,7 @@ Une empreinte du contenu des deux classeurs et du code invalide la référence l
 
 La simulation est recalculée au premier accès, après changement de sources ou lors d'une validation modifiant réellement les paramètres. Elle repart toujours de la référence non modulée : deux validations identiques ne cumulent pas deux fois les effets. L'état des résultats est remplacé seulement après réussite complète du calcul ; des paramètres invalides ne remplacent pas la dernière simulation.
 
-Tout reste dans `app.py` :
+Le moteur d’offre et le rapprochement sont dans `app.py` ; la demande appelle les modules existants `demand_projection.run` et `demand_projection.outcomes` :
 
 | Partie | Rôle |
 | --- | --- |
@@ -361,6 +358,8 @@ Tout reste dans `app.py` :
 | `logistic_fit`, `fit_status_models` | Ajuster les parts salariées et les raccorder aux observations |
 | `vacancy_projection` | Ajuster la tendance linéaire des postes non pourvus et la raccorder au dernier taux observé |
 | `diploma_history`, `project_diploma_distribution` | Lire les comptes annuels, extrapoler les cellules et inférer les installations |
+| `installation_history`, `project_installation_distribution` | Calculer les installations sur les observations, puis extrapoler leurs proportions historiques bornées pour les politiques publiques |
+| `origin_installation_flows`, `extrapolate_installations` | Agréger les stocks observés par origine, reconstituer les flux nationaux et extrapoler séparément leurs volumes |
 | `annual_routing` | Ventiler les parts annuelles entre départements |
 | `foreign_reference_flows`, `foreign_france_distribution` | Calculer le flux étranger sur le total français, son écart à 2026 et les proportions conditionnelles à la France |
 | `prepare_national_flows` | Calibrer les coefficients de cohortes, les flux et les retraits cumulés |
@@ -370,9 +369,13 @@ Tout reste dans `app.py` :
 | `apply_modulations` | Appliquer les fonctions sur des copies et vérifier les invariants |
 | `to_projections_frame` | Restituer exactement les cinq colonnes publiques |
 | `ensure_projections` | Calcul et mémorisation par session |
-| `main` | Formulaire, carte, courbes et méthode |
+| `demand_outcomes` | Charger un export de demande à jour ou appeler les modules de calcul de demande |
+| `compute_supply_demand` | Rapprocher les effectifs, les besoins, la population totale et l’activité par psychiatre |
+| `match_projections_frame` | Ajouter les quatre indicateurs de rapprochement, en conservant le solde signé |
+| `ensure_matching` | Mémoriser le rapprochement par session et l’invalider après une modification d’offre ou de ses entrées |
+| `main` | Formulaires, carte, courbes et méthode |
 
-Les répartitions annuelles sont d’abord calibrées avec la méthode et le taux de retraite validés. Ordre des effets sur le total : **dynamiques départementales → correction nationale de l’internat → tendance des arrivées étrangères → hausse supplémentaire des arrivées étrangères → places de formation → répartition par statut**. Le module `mobilite` décrit les contrôles de calibration ; sa contribution directe au stock est nulle. La tendance étrangère est un module sans contrôle d'activation, toujours appliqué. La dernière étape produit les deux comptes à partir de la part salariée extrapolée.
+Les répartitions démographiques et celles des politiques publiques sont calculées séparément. `routing` et `mobility_panel` conservent la voie démographique ; `intervention_routing` et `installation_panel` alimentent uniquement les curseurs. Les volumes des politiques sont dans `origin_installations`. Ordre des effets sur le total : **dynamiques départementales → correction nationale de l’internat → tendance des arrivées étrangères → hausse supplémentaire des arrivées étrangères → places de formation → répartition par statut**. Le module `mobilite` décrit les contrôles de calibration ; sa contribution directe au stock est nulle. La tendance étrangère est toujours appliquée. La dernière étape produit les deux comptes à partir de la part salariée extrapolée.
 
 Pour ajouter une modulation, écrire une fonction `ma_modulation(projected, parameters, context)` et ajouter une entrée `Modulation` dans `modulation_registry`. Les contrôles peuvent être `slider`, `checkbox`, `number` ou `select`. Le formulaire et sa validation sont communs. La fonction peut cibler département × année × scénario ; elle doit restituer les mêmes lignes, index et colonnes. Seule la colonne interne `effectif` peut être modifiée. Les observations ne sont pas transmises comme lignes modifiables aux fonctions.
 
@@ -490,7 +493,7 @@ Manque_France[t,s] = F_reference[t,s] - F_corrige[t,s]
 
 Les cohortes déjà entrées au plus tard en 2026 conservent leur flux de référence. Une entrée en 2027 a son premier effet sur l'effectif en **2032**, sans modifier les observations ni les arrivées de 2027–2031. Le délai de cinq ans concerne cette correction ; il reste distinct du délai réglable entre entrée en deuxième année et installation, dix ans par défaut.
 
-Le stock d'étudiants couvre la France ; le résultat affiché couvre la métropole. Pour ne pas retrancher un flux France entière à un total métropolitain, on reprend les poids régionaux de formation et la mobilité diplôme/exercice :
+Cette section concerne la correction de la trajectoire démographique, conservée à l'identique. Le stock d'étudiants couvre la France ; le résultat affiché couvre la métropole. Pour ne pas retrancher un flux France entière à un total métropolitain, on conserve les poids régionaux de formation et la mobilité démographique issue des stocks. Le sélecteur des politiques publiques ne les modifie pas :
 
 ```text
 m[t,s] = somme_origines_metropolitaines_o w[o,s] × somme_destinations_metropolitaines_j P[j|o,t]
@@ -521,7 +524,9 @@ Les vérifications portent sur les deux classeurs fournis, des cas synthétiques
 - saturation en cas d'extrapolation négative, résultat fini et non négatif ;
 - premiers ajouts de formation en 2037 pour la deuxième année 2027 et le délai de dix ans ; premières hausses d’arrivées étrangères en 2027 ;
 - lecture des 15 années et 15 origines de diplôme, contrôle des marges, installations négatives ramenées à zéro et proportions sommant à un ;
-- deux méthodes de répartition, sensibilité au taux de retraite, cas de flux nuls et règles de repli ;
+- installations historiques 2013–2026 recalculées indépendamment pour chaque couple, puis régressions indépendantes sur leurs pourcentages et sur les volumes nationaux par origine ;
+- pourcentages bornés à 0–100 %, renormalisation à 100 %, flux bornés à zéro, raccord exact en 2026 et fenêtres d'au moins cinq années ;
+- option de répartition par stocks modifiant uniquement les proportions des politiques, sans changer les volumes ni la trajectoire démographique ;
 - cumul indépendant des cohortes avec les proportions de leur année d’arrivée, pour les 96 départements et les quatre scénarios ;
 - indépendance du flux étranger vis-à-vis de la correction des places françaises et du délai de formation ;
 - calcul du maximum après agrégation nationale, sans transformer une mobilité entre deux régions en arrivée étrangère ;
@@ -531,13 +536,119 @@ Les vérifications portent sur les deux classeurs fournis, des cas synthétiques
 - comptes de salariés et libéraux/mixte retrouvant les totaux de chaque année et département, dont les comptes 2026 et ceux de Paris ;
 - pentes logistiques sur données synthétiques, raccord exact, parts bornées et cas à 0/100 % ;
 - pente nationale linéaire comparée à un ajustement indépendant, raccord au dernier taux observé, incréments annuels constants avant bornage et cas synthétiques atteignant 0 ou 100 % ;
-- structure publique de cinq colonnes avec quatre indicateurs et 90 624 lignes, unité en pourcentage pour la part ;
+- structure publique de cinq colonnes conservée : 90 624 lignes d’effectifs/statut et, avec la demande de test 2026–2070, 69 120 lignes supplémentaires de rapprochement ;
 - correction uniforme par département, premiers retraits en 2032, cohorte décalée de cinq ans, baisse récente de 2026 incluse et absence de réduction si la pente est négative ;
-- avec des curseurs nuls, écart à la version précédente exactement égal à la nouvelle contribution de tendance étrangère ;
+- avec les curseurs nuls, identité exacte avec la trajectoire démographique de la version fusionnée précédente ;
+- volumes des deux curseurs issus des installations historiques agrégées par origine, sans recours au stock d'internes pour calibrer les hausses de places ;
 - correction appliquée une seule fois aux nouvelles cohortes de places et conservation de la décomposition complète ;
-- six onglets, sélection des quatre indicateurs, choix du lieu de diplôme et affichage des unités ;
+- huit onglets, sélection des huit indicateurs, choix du lieu de diplôme et affichage des unités ;
 - conservation de la projection Lambert, du cadrage, des couleurs et des infobulles ; orientation correcte des 118 anneaux des 96 départements, y compris après inversion de leur sens, sans modification des limites ;
 - validation explicite, absence de cumul lors des clics répétés et indépendance de deux sessions ;
 - absence d'écriture des projections ou paramètres sur disque.
 
+- solde négatif conservé, carte centrée sur zéro, dénominateur tous âges requis, absence de double compte du total et de ses composantes ;
+- moyenne nationale calculée par ratio des sommes, variation de l’activité et de la couverture, absence de cumul des actes entre années ;
+- remplacement des hypothèses de productivité par une projection d’activité externe, contrôles des doublons, scénarios, années et données manquantes ;
+- validation séparée du rapprochement, mise à jour de l’offre après une politique sans modifier les besoins, maintien de l’offre si la demande ou la population est absente.
+
+**Limite de vérification :** les deux fichiers reçus pour cette fusion ne contiennent pas les dossiers `demand_projection/`, `dataDemand/`, ni une projection d’activité. Le moteur d’offre a été contrôlé sur les données réelles des classeurs déjà fournis ; le rapprochement et son interface ont été vérifiés avec une demande synthétique contrôlée. Ces données de test ne sont pas livrées comme des observations. L’exécution du module de demande et la jointure avec vos sources réelles restent à vérifier dans le dépôt complet.
+
 Ces contrôles vérifient le fonctionnement du code ; ils ne constituent pas une validation empirique des hypothèses de comportement.
+
+
+## 12. Rapprochement offre / demande en actes annuels
+
+### Indicateurs et calcul
+
+Le menu principal ajoute :
+
+1. **Actes annuels par psychiatre** : moyenne pondérée par les effectifs libéraux/mixte et salariés du département.
+2. **Actes disponibles pour le besoin sélectionné** : capacité annuelle affectée au champ du référentiel choisi.
+3. **Actes nécessaires pour le besoin sélectionné** : nombre annuel d’actes associé à la couverture cible du besoin.
+4. **Solde d’actes par habitant et par an** : différence entre actes disponibles et nécessaires, divisée par la population totale du département.
+
+Pour un département `d`, une année `t` et un scénario d’offre `s` :
+
+```text
+Actes_totaux[d,t,s] = Libéraux[d,t,s] × Activité_libérale[d,t,s]
+                    + Salariés[d,t,s] × Activité_salariée[d,t,s]
+Actes_par_psychiatre = Actes_totaux / Effectif_total
+Actes_disponibles = Actes_totaux × Part_offre_mobilisable
+Personnes_ciblées = Personnes_avec_besoin × Couverture_cible
+Actes_nécessaires = Personnes_ciblées × Actes_par_personne_ciblée
+Solde_par_habitant = (Actes_disponibles − Actes_nécessaires) / Population_totale
+```
+
+Les pourcentages du formulaire sont convertis en fractions pour ces équations. Si l’effectif est nul, l’offre et la moyenne d’actes par psychiatre sont définies à zéro. Le solde reste calculable à condition que la population totale soit strictement positive.
+
+**Négatif : manque théorique d’actes ; positif : marge théorique dans le périmètre choisi.** Le solde n’est pas tronqué à zéro. Il ne mesure ni les rendez-vous réellement disponibles, ni l’équilibre de l’ensemble de la psychiatrie. Les actes sont annuels : on ne cumule pas les déficits ni les actes entre années. Les effectifs utilisés incluent déjà les effets cumulés des cohortes simulées. Le solde métropolitain est `somme des soldes en actes / somme des populations`, pas une moyenne simple des ratios départementaux.
+
+Un seul indicateur de besoin est sélectionné. Le cumul adulte dépression/anxiété n’est jamais additionné à ses composantes ou à l’indicateur enfant. Il conserve l’hypothèse explicite d’absence de recouvrement entre dépression et anxiété de la demande reçue. Les projections de demande et d’offre gardent des scénarios distincts : le scénario Insee et le scénario de besoin sont validés dans le formulaire, le scénario DREES reste choisi dans le menu de la carte.
+
+### Paramètres initiaux, tous modifiables
+
+| Paramètre | Défaut | Interprétation et origine |
+| --- | ---: | --- |
+| Consultations annuelles par psychiatre libéral ou mixte | 2 515 | Calibration approximative CNAM 2024, portée à 2026 par convention |
+| Activité salariée / libérale | 0,65 | Hypothèse de conversion en équivalents de consultation ; pas une mesure récente de l’activité hospitalière |
+| Évolution annuelle de l’activité par psychiatre | 0 % | Projection constante par défaut ; paramètre réglable entre −5 % et +5 % |
+| Actes annuels par personne ciblée | 8 | Hypothèse descriptive de suivi, pas une recommandation clinique par trouble |
+| Couverture cible du besoin par un psychiatre | 25 % | Hypothèse sur la part du besoin potentiel à couvrir par un psychiatre, pas un taux de recours observé |
+| Part des actes mobilisable pour ce besoin | 50 % | Hypothèse réservant une part de l’offre aux troubles et âges hors du référentiel sélectionné |
+
+La [fiche CNAM 2024 sur les psychiatres et neuropsychiatres libéraux](https://www.assurance-maladie.ameli.fr/sites/default/files/2024_fiche_psychiatres-et-neuro-psychiatres-liberaux.pdf) indique 15,865 millions de consultations et téléconsultations et 6 308 praticiens en fin d’année, soit environ 2 515 par praticien. Le volume annuel comprend aussi l’activité de praticiens ayant cessé en cours d’année : ce ratio est une approximation, pas une mesure individuelle de productivité. La fiche indique aussi environ 318 patients différents par praticien, donnant un ordre de grandeur descriptif proche de huit consultations par patient. Ce nombre ne définit pas les soins nécessaires pour chaque trouble ou gravité. Les [recommandations HAS sur la dépression de l’adulte](https://www.has-sante.fr/jcms/pprd_2974237/fr/depression-de-l-adulte-reperage-et-prise-en-charge-initiale) décrivent un suivi adapté à la situation clinique ; elles ne justifient pas un quota universel de huit actes.
+
+Les valeurs de 0,65, 25 % et 50 % sont des **hypothèses de scénario à calibrer**, non des paramètres estimés dans les fichiers fournis. L’activité est exprimée en équivalents de consultation afin d’aligner les unités ; hospitalisations, travail en équipe et consultations facturées ne sont pas directement interchangeables. Il convient d’appliquer la même définition d’acte à l’offre et au besoin lors d’une calibration métier.
+
+Sans projection d’activité externe, l’activité suit :
+
+```text
+Activité_libérale[t] = Activité_libérale[2026] × (1 + Croissance_annuelle)^(t − 2026)
+Activité_salariée[t] = Activité_libérale[t] × Ratio_salarié
+```
+
+Il s’agit d’une projection paramétrique, pas d’une tendance d’activité estimée à partir d’une série historique. Les paramètres prennent effet avec « Valider l’offre / demande ». Le changement des curseurs d’effectifs après « Valider » actualise aussi les actes disponibles, en conservant la demande validée.
+
+### Population totale : entrée obligatoire pour un solde par habitant
+
+Deux entrées sont acceptées :
+
+- une colonne `population_total` (ou `total_population`, `population_totale`) dans le résultat de demande ;
+- un CSV `dataDemand/output/population_totale.csv`, ou un CSV chargé dans le volet « Paramètres offre / demande ».
+
+Colonnes du fichier séparé :
+
+| Colonne | Contenu |
+| --- | --- |
+| `dep` ou `department` | Code départemental ou nom reconnu |
+| `annee` ou `year` | Année entière |
+| `demographic_scenario` | Nom exact du scénario Insee, par exemple `Central` |
+| `population_total` | Population résidente totale, tous âges, strictement positive |
+
+Le nom `population` est aussi accepté dans ce **fichier explicitement déclaré de population totale**. Le scénario Insee est obligatoire pour éviter une association involontaire de populations et de besoins issus de scénarios différents. Les codes `075`, `02A`, etc. sont normalisés. Si la population est répétée dans plusieurs lignes d’indicateurs de demande, ces répétitions ne sont dédupliquées que lorsque les valeurs concordent.
+
+**`population_at_risk` n’est jamais utilisée comme dénominateur par habitant.** Les 18–79 ans ou les 6–11 ans ne représentent pas la population totale, et des populations à risque de plusieurs troubles peuvent se recouvrir. Aucune somme de ces populations n’est effectuée pour reconstituer artificiellement un total.
+
+Le champ du rapprochement est celui de l’offre, soit 96 départements métropolitains. Les éventuelles lignes ultramarines sont exclues du rapprochement sans être retirées de l’onglet de demande indépendant. Sur la période commune à l’offre et à la demande, à partir de 2026, chaque couple département/année doit disposer d’un besoin et d’une population. Les trous, doublons incohérents, années manquantes et valeurs non finies provoquent un message explicite : aucun zéro, report ou interpolation n’est substitué.
+
+### Projection d’activité externe facultative
+
+Un CSV `dataSupply/actes_par_psychiatre.csv`, ou un CSV chargé dans le même volet, peut remplacer les hypothèses de productivité. Il doit contenir :
+
+| Colonne | Rôle |
+| --- | --- |
+| `annee` ou `year` | Obligatoire : année de l’activité projetée |
+| `actes_liberal` et `actes_salarie` | Deux volumes annuels par psychiatre, un par statut |
+| `actes_par_psychiatre` | Alternative aux deux colonnes précédentes : même moyenne appliquée aux deux statuts |
+| `dep` ou `department` | Facultative : si absente, les valeurs s’appliquent à tous les départements |
+| `scenario` | Facultative : si absente, les valeurs s’appliquent à tous les scénarios DREES |
+
+Les volumes doivent être non négatifs et couvrir toute la période du rapprochement. La projection fournie **remplace** la valeur initiale, le ratio salarié et la croissance annuelle du formulaire : ces trois paramètres ne sont pas appliqués une seconde fois. La couverture, les actes par personne ciblée et la part d’offre mobilisable continuent de s’appliquer.
+
+### Contrat d’intégration avec la demande et fusion
+
+Les ajouts reçus sont conservés : `demand_projection.run` fournit `SCENARIO_FILES`, `build_projection` et `summarize_projection` ; `demand_projection.outcomes` fournit `prepare_outcomes`. Le résultat attendu contient `department`, `year`, `demographic_scenario`, `need_scenario`, `indicator`, `label`, `population_at_risk`, `prevalence` et `persons_with_need`. La population totale peut y être ajoutée ou être fournie séparément comme ci-dessus. Les codes des indicateurs sont lus dans les résultats, pas supposés dans le rapprochement.
+
+`dataDemand/` conserve les fichiers Insee indiqués par `SCENARIO_FILES`, `prevalence_parameters.csv`, `need_scenarios.csv` et, s’il existe, `territorial_modifiers.csv`. L’export `dataDemand/output/demand_projection_summary.csv` n’est utilisé que s’il est à jour ; sinon la demande est recalculée en mémoire. Les imports de demande sont différés : une dépendance absente affiche une erreur dans l’onglet concerné sans empêcher l’offre de fonctionner.
+
+Pour intégrer la fusion, remplacer `app.py` et `README.md` dans le dépôt et conserver les modules, données et dépendances existants. Les deux fichiers fusionnés ne recréent pas les dossiers de demande absents des pièces jointes. Aucun commit n’est effectué. Les calculs de stocks démographiques, des installations pour les politiques publiques, des statuts et de l’internat sont conservés ; le rapprochement est une étape en aval qui ne modifie pas les effectifs.
