@@ -1449,22 +1449,94 @@ def vacancy_figure(curve, calibration):
     return figure
 
 
+def insee_total_population(population, years, scenario):
+    """Total tous âges, sans modifier les modules de demande ni sommer leurs indicateurs."""
+    from demand_projection.run import parse_age_band
+
+    keys = ["ZONE", "SEXE", "TRAGE"]
+    columns = [f"POP_{year}" for year in years]
+    if population.empty or population[keys].isna().any().any():
+        raise ValueError("Population Insee vide ou clés âge/sexe/département manquantes.")
+    if population.duplicated(keys).any():
+        raise ValueError("Population Insee dupliquée par département, sexe et tranche d'âge.")
+    if set(population.SEXE.unique()) != {1, 2}:
+        raise ValueError("Le total Insee nécessite les deux sexes, sans ligne de total ajoutée.")
+    bands = sorted(population.TRAGE.unique(), key=lambda label: parse_age_band(label).lower)
+    ranges = [parse_age_band(label) for label in bands]
+    if ranges[0].lower != 0 or not str(bands[-1]).endswith("+]") or any(
+        left.upper != right.lower for left, right in zip(ranges, ranges[1:])
+    ):
+        raise ValueError("Les tranches Insee doivent couvrir tous les âges sans trou ni recouvrement.")
+    if (not population.groupby(["ZONE", "SEXE"]).TRAGE.nunique().eq(len(bands)).all()
+            or not population.groupby("ZONE").SEXE.nunique().eq(2).all()):
+        raise ValueError("Tranches d'âge ou sexe manquants pour un département Insee.")
+    values = population[columns].apply(pd.to_numeric, errors="raise")
+    if not np.isfinite(values.to_numpy()).all() or (values < 0).any().any():
+        raise ValueError("Population Insee manquante, négative ou non finie.")
+    grouped = values.groupby(population.ZONE).sum().reset_index()
+    totals = grouped.melt(id_vars="ZONE", var_name="_year", value_name="population_total")
+    totals["department"] = totals.ZONE.astype(str)
+    totals["year"] = totals._year.str.extract(r"(\d{4})").astype(int)
+    totals["demographic_scenario"] = scenario
+    return totals[["department", "year", "demographic_scenario", "population_total"]]
+
+
+def join_demand_population(demand, population):
+    """Joindre après les agrégations de besoin : chaque total est utilisé une seule fois."""
+    keys = ["department", "year", "demographic_scenario"]
+    if population.duplicated(keys).any():
+        raise ValueError("Population totale dupliquée par département, année et scénario Insee.")
+    # Les anciens modules ne transmettent pas population_total au cumul adulte.
+    # Reconstituer cette colonne pour tous les indicateurs depuis la même source.
+    result = demand.drop(columns=["population_total"], errors="ignore").merge(
+        population[keys + ["population_total"]], on=keys, how="left", validate="many_to_one")
+    invalid = ~np.isfinite(result.population_total) | (result.population_total <= 0)
+    if invalid.any():
+        examples = result.loc[invalid, keys].drop_duplicates().head(4).to_dict("records")
+        raise ValueError(f"Population totale Insee absente ou invalide pour la demande : {examples}.")
+    return result
+
+
 @st.cache_data(show_spinner=False, max_entries=2)
-def load_demand_summary(path: str, modified_at_ns: int):
-    """Read generated outcomes; the timestamp invalidates the cache."""
-    del modified_at_ns
+def load_demand_summary(path: str, modified_at_ns: int, signature):
+    """Compléter aussi les exports existants, sans exiger un nouveau CSV."""
+    del modified_at_ns, signature
+    from demand_projection.run import SCENARIO_FILES, read_population_workbook
     from demand_projection.outcomes import prepare_outcomes
-    return prepare_outcomes(pd.read_csv(path))
+
+    demand = prepare_outcomes(pd.read_csv(path).drop(columns=["population_total"], errors="ignore"))
+    totals = []
+    for scenario, filename in SCENARIO_FILES.items():
+        population, years = read_population_workbook(ROOT / "dataDemand" / filename)
+        totals.append(insee_total_population(population, years, scenario))
+    return join_demand_population(demand, pd.concat(totals, ignore_index=True))
 
 
 @st.cache_data(show_spinner=False, max_entries=2)
 def compute_demand_summary(signature):
-    """Support fresh checkouts without committing generated CSV files."""
+    """Calcul en mémoire avec les modules d'origine ; adaptation limitée à app.py."""
     del signature
-    from demand_projection.run import build_projection, summarize_projection
+    from demand_projection.run import (SCENARIO_FILES, read_population_workbook,
+        validate_parameters, read_need_scenarios, read_territorial_modifiers,
+        project_workbook, summarize_projection)
     from demand_projection.outcomes import prepare_outcomes
 
-    return prepare_outcomes(summarize_projection(build_projection(ROOT / "dataDemand", None, 2026)))
+    data_dir = ROOT / "dataDemand"
+    parameters = validate_parameters(pd.read_csv(data_dir / "prevalence_parameters.csv"))
+    scenarios = read_need_scenarios(data_dir / "need_scenarios.csv")
+    modifiers = read_territorial_modifiers(data_dir / "territorial_modifiers.csv")
+    projections, totals = [], []
+    for scenario, filename in SCENARIO_FILES.items():
+        population, years = read_population_workbook(data_dir / filename)
+        totals.append(insee_total_population(population, years, scenario))
+        # Le module d'origine affecte des proratas aux colonnes POP_YYYY.
+        # Préparer des flottants localement évite les erreurs de dtype sous pandas 3.
+        columns = [f"POP_{year}" for year in years]
+        population = population.astype({column: float for column in columns})
+        projections.append(project_workbook(population, years, scenario, parameters, scenarios, modifiers, 2026))
+    summary = summarize_projection(pd.concat(projections, ignore_index=True))
+    demand = prepare_outcomes(summary.drop(columns=["population_total"], errors="ignore"))
+    return join_demand_population(demand, pd.concat(totals, ignore_index=True))
 
 
 def demand_outcomes():
@@ -1482,7 +1554,7 @@ def demand_outcomes():
     if DEMAND_SUMMARY_PATH.exists():
         modified = DEMAND_SUMMARY_PATH.stat().st_mtime_ns
         if modified >= max(item[1] for item in signature):
-            return load_demand_summary(str(DEMAND_SUMMARY_PATH), modified)
+            return load_demand_summary(str(DEMAND_SUMMARY_PATH), modified, signature)
     return compute_demand_summary(signature)
 
 
@@ -1583,6 +1655,9 @@ def match_department_codes(frame, baseline):
     names = {normalize(row.nom): row.dep for row in baseline.itertuples()}
     names.update({normalize(name): code for code, name in {
         "971": "Guadeloupe", "972": "Martinique", "973": "Guyane", "974": "La Réunion", "976": "Mayotte"}.items()})
+    names[normalize("Réunion")] = "974"  # Libellé Omphale, reconnu avant le filtre métropole.
+    # Le classeur d'effectifs nomme le département 62 « Nord-Pas-de-Calais ».
+    names[normalize("Pas-de-Calais")] = "62"
     def code(value):
         raw = str(value).strip().upper()
         if re.fullmatch(r"\d+\.0", raw):
@@ -1915,14 +1990,21 @@ def main():
     with st.sidebar:
         indicator = st.selectbox("Indicateur", list(INDICATORS.values()) + list(MATCH_INDICATORS.values()))
         scenario = st.selectbox("Scénario", sorted(df.scenario.unique()))
-        year = st.slider("Année", int(df.annee.min()), int(df.annee.max()), anchor)
+        indicator_years = df.loc[df.indicateur == indicator, "annee"]
+        lower = int(indicator_years.min()) if not indicator_years.empty else anchor
+        upper = int(indicator_years.max()) if not indicator_years.empty else int(df.annee.max())
+        st.session_state.map_year = max(lower, min(upper, st.session_state.get("map_year", anchor)))
+        year = (st.slider("Année", lower, upper, key="map_year") if lower < upper
+                else st.selectbox("Année", [lower], key="map_year"))
+        if indicator in MATCH_INDICATORS.values() and not indicator_years.empty:
+            st.caption(f"Actes : données disponibles de {lower} à {upper}.")
     tab_map, tab_trends, tab_status, tab_internat, tab_mobility, tab_demand, tab_match, tab_method = st.tabs(["Carte et indicateurs", "Dynamiques départementales", "Statuts d’exercice", "Internat national", "Diplômes et installations", "Demande de soins", "Offre / demande", "Calibration et hypothèses"])
     names = context["baseline"].set_index("dep").nom.to_dict()
     with tab_map:
         selected = df[(df.indicateur == indicator) & (df.scenario == scenario) & (df.annee == year)].copy()
         selected["nom"] = selected.dep.map(names)
         if selected.empty and indicator in MATCH_INDICATORS.values():
-            st.info(matching_error or "Indicateur disponible uniquement sur la période commune à l'offre, à la demande et à la population totale.")
+            st.warning(matching_error or "Indicateur disponible uniquement sur la période commune à l'offre, à la demande et à la population totale.")
         try:
             gj = load_geojson()
         except (OSError, ValueError) as exc:
@@ -1959,7 +2041,8 @@ def main():
                               coloraxis_colorbar=dict(title=dict(text=value_label, side="right"),
                                                       thickness=12, len=0.6, outlinewidth=0))
             map_col.plotly_chart(fig, width="stretch")
-        table_col.dataframe(selected.sort_values("valeur")[["dep", "nom", "valeur"]].rename(columns={"valeur": value_label}), hide_index=True, width="stretch")
+        if not selected.empty:
+            table_col.dataframe(selected.sort_values("valeur")[["dep", "nom", "valeur"]].rename(columns={"valeur": value_label}), hide_index=True, width="stretch")
         if indicator in MATCH_INDICATORS.values():
             st.caption("Rapprochement annuel selon les paramètres validés de l'offre / demande. Solde négatif : manque d'actes ; positif : marge théorique pour le besoin choisi. La carte est centrée sur zéro pour le solde, sans supprimer les valeurs négatives.")
             if matching is not None:
