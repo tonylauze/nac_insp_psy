@@ -2246,6 +2246,11 @@ def render_match_tab(matching, error, scenario, year, names):
 # ---------- Interface : navigation, page Scénarios, page Projections ----------
 FAMILY_SUPPLY, FAMILY_DEMAND, FAMILY_MATCH = "Offre", "Demande", "Offre / demande"
 DEMAND_MEASURES = {"count": "personnes avec besoin potentiel", "rate": "pour 1 000 habitants"}
+MAP_HEIGHT = 620  # Pixels : carte et sélecteurs visibles ensemble sur un écran d'ordinateur portable.
+# Marges Streamlit réduites en haut de page, pour laisser la place à la carte.
+PAGE_STYLE = """<style>
+[data-testid="stMainBlockContainer"] {padding-top: 2.2rem; padding-bottom: 2rem;}
+</style>"""
 
 
 def keep_selection(key):
@@ -2443,7 +2448,7 @@ def render_map_tab(app, df, demand, demand_error, matching, matching_error, scen
     map_area = st.container()
     controls = st.container(border=True)
     with controls:
-        family_col, indicator_col, drees_col = st.columns([1.6, 2.9, 1.2])
+        family_col, indicator_col, drees_col, year_col = st.columns([1.55, 2.3, 1.15, 2.2], vertical_alignment="bottom")
         with family_col:
             family = segmented("Thème", [FAMILY_SUPPLY, FAMILY_DEMAND, FAMILY_MATCH], "map_family")
         demand_rows = None
@@ -2475,8 +2480,9 @@ def render_map_tab(app, df, demand, demand_error, matching, matching_error, scen
         years = rows.annee if not rows.empty else df.annee
         lower, upper = int(years.min()), int(years.max())
         st.session_state.map_year = max(lower, min(upper, st.session_state.get("map_year", anchor)))
-        year = (st.slider("Année", lower, upper, key="map_year") if lower < upper
-                else st.selectbox("Année", [lower], key="map_year"))
+        with year_col:
+            year = (st.slider("Année", lower, upper, key="map_year") if lower < upper
+                    else st.selectbox("Année", [lower], key="map_year"))
     if family == FAMILY_DEMAND:
         unit = DEMAND_MEASURES[indicator[1]] if indicator else ""
         value_label = f"Besoin potentiel ({unit})"
@@ -2542,7 +2548,7 @@ def render_choropleth(selected, scale_values, value_label, indicator):
     fig.update_geos(projection=dict(type="conic conformal", parallels=[44, 49], rotation=dict(lon=3)),
                     center=dict(lon=2.3, lat=46.3), lonaxis_range=[-5.3, 9.8], lataxis_range=[41.2, 51.2],
                     visible=False, bgcolor="rgba(0,0,0,0)")
-    fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), height=820, dragmode=False,
+    fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), height=MAP_HEIGHT, dragmode=False,
                       paper_bgcolor="rgba(0,0,0,0)", separators=", ",
                       coloraxis_colorbar=dict(title=dict(text=value_label, side="right"),
                                               thickness=14, len=0.7, outlinewidth=0))
@@ -2554,7 +2560,7 @@ def render_projections_page(app, scenarios_page):
     signature, names, labels = app["signature"], app["names"], app["labels"]
     scenario = complete_matching(st.session_state.scenario_active, app["match_defaults"])
     proposed = scenario["offre"]
-    st.title("Projections des effectifs de psychiatres par département")
+    st.markdown("## Projections des effectifs de psychiatres par département")
     try:
         with st.spinner(f"Calcul du scénario « {scenario['nom']} »…"):
             df, metadata, recalculated = ensure_projections(signature, proposed, reference, metadata, context)
@@ -2570,14 +2576,15 @@ def render_projections_page(app, scenarios_page):
         st.toast(f"Projections recalculées : {scenario['nom']}.")
     anchor = context["anchor"]
     state = st.session_state.psy_projection
-    with st.container(border=True):
-        left, right = st.columns([5, 1], vertical_alignment="center")
-        left.markdown(f"Scénario actif : **{scenario['nom']}** · :gray[{scenario['origine']}]")
-        left.caption(" · ".join(scenario_highlights(scenario, context, labels)))
-        right.page_link(scenarios_page, label="Changer de scénario", icon=":material/tune:")
     mode_text = (f"croissance nationale DREES raccordée aux effectifs RPPS de {anchor} (psychiatrie absente des projections régionales)"
                  if metadata["mode_projection"] == "national" else "projections régionales détaillées de psychiatrie")
-    st.caption(f"Observé : {df.annee.min()}–{anchor}. Projeté : {anchor + 1}–{df.annee.max()}. Référence : {mode_text}.")
+    left, detail, change = st.columns([4, 1.3, 1.5], vertical_alignment="center")
+    left.markdown(f"Scénario actif : **{scenario['nom']}** · :gray[{scenario['origine']}] · "
+                  f":gray[observé {df.annee.min()}–{anchor}, projeté {anchor + 1}–{df.annee.max()}]")
+    with detail.popover("Détail du scénario", width="stretch"):
+        st.markdown("  \n".join(scenario_highlights(scenario, context, labels)))
+        st.caption(f"Référence : {mode_text}.")
+    change.page_link(scenarios_page, label="Changer de scénario", icon=":material/tune:")
     demand, demand_error = app["demand"], app["demand_error"]
     matching, matching_error = None, None
     try:
@@ -2713,6 +2720,7 @@ def render_projections_page(app, scenarios_page):
 
 def main():
     st.set_page_config(page_title="Projections psychiatres", layout="wide")
+    st.markdown(PAGE_STYLE, unsafe_allow_html=True)
     try:
         require_excel_reader()
         signature = source_signature()
