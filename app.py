@@ -2246,10 +2246,25 @@ def render_match_tab(matching, error, scenario, year, names):
 # ---------- Interface : navigation, page Scénarios, page Projections ----------
 FAMILY_SUPPLY, FAMILY_DEMAND, FAMILY_MATCH = "Offre", "Demande", "Offre / demande"
 DEMAND_MEASURES = {"count": "personnes avec besoin potentiel", "rate": "pour 1 000 habitants"}
-MAP_HEIGHT = 620  # Pixels : carte et sélecteurs visibles ensemble sur un écran d'ordinateur portable.
-# Marges Streamlit réduites en haut de page, pour laisser la place à la carte.
-PAGE_STYLE = """<style>
-[data-testid="stMainBlockContainer"] {padding-top: 2.2rem; padding-bottom: 2rem;}
+SIDEBAR_WIDTH = 220  # Pixels.
+# La carte occupe la hauteur de la fenêtre moins l'en-tête, les onglets et la ligne
+# de sélecteurs : titre, carte et options restent visibles ensemble, sans défilement.
+MAP_RESERVED_HEIGHT = 305  # Pixels hors carte, mesurés sur la page Projections.
+MAP_MIN_HEIGHT = 340
+PAGE_STYLE = f"""<style>
+[data-testid="stMainBlockContainer"] {{padding-top: 2.3rem; padding-bottom: 2rem;}}
+[data-testid="stSidebar"] {{width: {SIDEBAR_WIDTH}px !important; min-width: {SIDEBAR_WIDTH}px !important;
+                           max-width: {SIDEBAR_WIDTH}px !important;}}
+[data-testid="stSidebarContent"] {{padding-top: 0.4rem;}}
+[data-testid="stNavSectionHeader"] p {{font-size: 0.78rem; font-weight: 600; letter-spacing: 0.06em;
+                                       text-transform: uppercase; opacity: 0.75;}}
+[data-testid="stSidebarNavLink"] {{border: 1px solid rgba(49, 51, 63, 0.2); border-radius: 0.5rem;
+                                   padding: 0.55rem 0.75rem; margin-bottom: 0.4rem;}}
+[data-testid="stSidebarNavLink"] p {{font-size: 1.02rem; font-weight: 600;}}
+[data-testid="stSidebarNavLink"][aria-current="page"] {{background: #c53948; border-color: #c53948;}}
+[data-testid="stSidebarNavLink"][aria-current="page"] * {{color: #ffffff !important;}}
+.st-key-map_box {{height: calc(100vh - {MAP_RESERVED_HEIGHT}px) !important; min-height: {MAP_MIN_HEIGHT}px;
+                  flex: 0 0 auto !important;}}
 </style>"""
 
 
@@ -2292,11 +2307,23 @@ def edit_scenario(scenario, registry, name=None):
     st.session_state.scenario_mode__last = MODE_CREATE
 
 
-def render_sidebar_summary(scenario, context, labels):
+def scenario_short_lines(scenario):
+    """Trois repères courts pour la barre latérale ; le détail est sur les pages."""
+    offre = scenario["offre"]
+    places = [offre["formation"][f"region_{code}"] for code in REGIONS if offre["formation"].get(f"region_{code}")]
+    first = offre["formation"]["rentree"] + offre["formation"]["delai"]
+    size = (f"+{places[0]} %" if len(set(places)) == 1 else f"+{min(places)} à +{max(places)} %") if places else ""
+    hausse = offre["immigration"]["hausse"]
+    return [f"Places : {size} ({len(places)} rég.) dès {first}" if places else "Places : inchangées",
+            f"Étranger : +{hausse} % dès {offre['immigration']['debut']}" if hausse else "Étranger : tendance seule",
+            "Internat : correction " + ("active" if offre["internat"]["active"] else "désactivée")]
+
+
+def render_sidebar_summary(scenario):
     with st.sidebar:
         st.caption("SCÉNARIO ACTIF")
         st.markdown(f"**{scenario['nom']}**  \n:gray[{scenario['origine']}]")
-        st.caption("  \n".join(scenario_highlights(scenario, context, labels)))
+        st.caption("  \n".join(scenario_short_lines(scenario)))
 
 
 def render_scenarios_page(app, projections_page):
@@ -2445,10 +2472,10 @@ def render_map_tab(app, df, demand, demand_error, matching, matching_error, scen
     """Carte pleine largeur, sélecteurs dessous ; renvoie la projection DREES et l'année choisies."""
     context, names = app["context"], app["names"]
     anchor, labels = context["anchor"], app["labels"]
-    map_area = st.container()
-    controls = st.container(border=True)
+    map_area = st.container(key="map_box")
+    controls = st.container()
     with controls:
-        family_col, indicator_col, drees_col, year_col = st.columns([1.55, 2.3, 1.15, 2.2], vertical_alignment="bottom")
+        family_col, indicator_col, drees_col, year_col = st.columns([2.35, 1.75, 1.35, 1.75], vertical_alignment="bottom")
         with family_col:
             family = segmented("Thème", [FAMILY_SUPPLY, FAMILY_DEMAND, FAMILY_MATCH], "map_family")
         demand_rows = None
@@ -2548,11 +2575,11 @@ def render_choropleth(selected, scale_values, value_label, indicator):
     fig.update_geos(projection=dict(type="conic conformal", parallels=[44, 49], rotation=dict(lon=3)),
                     center=dict(lon=2.3, lat=46.3), lonaxis_range=[-5.3, 9.8], lataxis_range=[41.2, 51.2],
                     visible=False, bgcolor="rgba(0,0,0,0)")
-    fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), height=MAP_HEIGHT, dragmode=False,
+    fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), dragmode=False,
                       paper_bgcolor="rgba(0,0,0,0)", separators=", ",
                       coloraxis_colorbar=dict(title=dict(text=value_label, side="right"),
                                               thickness=14, len=0.7, outlinewidth=0))
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, width="stretch", height="stretch")
 
 
 def render_projections_page(app, scenarios_page):
@@ -2560,7 +2587,9 @@ def render_projections_page(app, scenarios_page):
     signature, names, labels = app["signature"], app["names"], app["labels"]
     scenario = complete_matching(st.session_state.scenario_active, app["match_defaults"])
     proposed = scenario["offre"]
-    st.markdown("## Projections des effectifs de psychiatres par département")
+    # En-tête sur une ligne : titre, scénario actif (détail au clic), lien vers Scénarios.
+    title, detail, change = st.columns([3.3, 1.6, 1.25], vertical_alignment="center")
+    title.markdown("### Projections des effectifs de psychiatres par département")
     try:
         with st.spinner(f"Calcul du scénario « {scenario['nom']} »…"):
             df, metadata, recalculated = ensure_projections(signature, proposed, reference, metadata, context)
@@ -2578,12 +2607,11 @@ def render_projections_page(app, scenarios_page):
     state = st.session_state.psy_projection
     mode_text = (f"croissance nationale DREES raccordée aux effectifs RPPS de {anchor} (psychiatrie absente des projections régionales)"
                  if metadata["mode_projection"] == "national" else "projections régionales détaillées de psychiatrie")
-    left, detail, change = st.columns([4, 1.3, 1.5], vertical_alignment="center")
-    left.markdown(f"Scénario actif : **{scenario['nom']}** · :gray[{scenario['origine']}] · "
-                  f":gray[observé {df.annee.min()}–{anchor}, projeté {anchor + 1}–{df.annee.max()}]")
-    with detail.popover("Détail du scénario", width="stretch"):
+    with detail.popover(f"Scénario : {scenario['nom']}", icon=":material/info:", width="stretch",
+                        help="Paramètres du scénario actif"):
+        st.markdown(f"**{scenario['nom']}** · :gray[{scenario['origine']}]")
         st.markdown("  \n".join(scenario_highlights(scenario, context, labels)))
-        st.caption(f"Référence : {mode_text}.")
+        st.caption(f"Observé : {df.annee.min()}–{anchor}. Projeté : {anchor + 1}–{df.annee.max()}. Référence : {mode_text}.")
     change.page_link(scenarios_page, label="Changer de scénario", icon=":material/tune:")
     demand, demand_error = app["demand"], app["demand_error"]
     matching, matching_error = None, None
@@ -2766,7 +2794,7 @@ def main():
     pages["projections"] = st.Page(projections, title="Projections", icon=":material/map:", url_path="projections", default=True)
     pages["scenarios"] = st.Page(scenarios, title="Scénarios", icon=":material/tune:", url_path="scenarios")
     navigation = st.navigation({"Tableau de bord": [pages["projections"], pages["scenarios"]]})
-    render_sidebar_summary(st.session_state.scenario_active, context, labels)
+    render_sidebar_summary(st.session_state.scenario_active)
     navigation.run()
 
 
