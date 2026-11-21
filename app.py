@@ -10,8 +10,14 @@ Les résultats sont un DataFrame de cinq colonnes :
     dep, annee, scenario, indicateur, valeur
 Ils restent dans st.session_state, sans aucun fichier de résultats ou paramètres.
 Chaque utilisateur dispose de ses propres paramètres et projections. Changer
-seulement un filtre d'affichage ne relance pas la simulation. Les paramètres sont
-appliqués après Valider et reviennent aux valeurs initiales dans une nouvelle session.
+seulement un filtre d'affichage ne relance pas la simulation.
+
+Interface : deux pages réunies dans le « Tableau de bord » de la barre latérale.
+  - Scénarios : choisir un scénario prédéfini, en créer un, l'exporter ou l'importer
+    (CSV, une ligne par paramètre). Les paramètres ne s'appliquent qu'au clic sur
+    « Appliquer » et reviennent au scénario Base dans une nouvelle session.
+  - Projections : carte et sélecteurs (thème, indicateur, projection DREES, année),
+    puis les onglets de diagnostic du scénario actif.
 
 Si les projections régionales de psychiatrie manquent, repli AUTOMATIQUE :
     N_dep(t, s) = N_RPPS_dep(b) * N_DREES_France(t, s) / N_DREES_France(b, s)
@@ -34,11 +40,12 @@ from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
 from typing import Callable
+import csv
 import json
 import re
 import unicodedata
 import urllib.request
-from io import BytesIO
+from io import BytesIO, StringIO
 
 import numpy as np
 import pandas as pd
@@ -1278,32 +1285,396 @@ def ensure_projections(signature, parameters, reference, metadata, context):
     return output, metadata, True
 
 
-def render_parameters(applied, registry):
-    draft = {}
+# ---------- Scénarios : définition, prédéfinis, export et import ----------
+# Un scénario regroupe tous les paramètres structurels et de politiques publiques :
+#   {"nom", "origine", "offre": paramètres des modulations, "rapprochement": paramètres offre/demande}
+# Il ne contient aucun résultat : les projections sont recalculées à son application.
+MATCH_BLOCK = "rapprochement"
+MATCH_BLOCK_LABEL = "Rapprochement offre / demande"
+MATCH_CHOICES = (("demographic_scenario", "Scénario démographique Insee"),
+                 ("need_scenario", "Scénario de besoin"),
+                 ("need_indicator", "Besoin de référence"))
+# (clé, libellé, minimum, maximum, pas, aide) ; bornes identiques à validate_match_parameters.
+MATCH_CONTROLS = (
+    ("actes_liberal", "Consultations annuelles par psychiatre libéral ou mixte", 0.0, 20000.0, 50.0, "Valeur initiale approximative CNAM 2024 : 2 515 consultations et téléconsultations par praticien. Portée en 2026 par convention."),
+    ("ratio_salarie", "Activité salariée / activité libérale", 0.0, 2.0, 0.05, "Hypothèse initiale de 0,65, conversion en actes équivalents ; ajustable, ce n'est pas une mesure actuelle de toute l'activité hospitalière."),
+    ("croissance_activite", "Évolution annuelle de l'activité par psychiatre (%)", -5.0, 5.0, 0.1, "0 % maintient la productivité de référence. Une projection d'activité fournie remplace ces trois paramètres."),
+    ("actes_par_besoin", "Actes annuels par personne ciblée", 0.0, 100.0, 1.0, "Hypothèse initiale : 8 actes équivalents par an. Ordre de grandeur descriptif, pas une recommandation clinique par trouble."),
+    ("couverture", "Couverture cible du besoin par un psychiatre (%)", 0.0, 100.0, 5.0, "Part des personnes avec besoin potentiel ciblée par un suivi psychiatrique. 25 % est une hypothèse de scénario, pas un taux observé."),
+    ("part_offre", "Part des actes mobilisable pour ce besoin (%)", 0.0, 100.0, 5.0, "50 % est une hypothèse de scénario pour réserver une part de l'activité aux troubles et âges hors référentiel. Ce paramètre évite d'affecter implicitement toute l'offre à un seul besoin."),
+)
+# Regroupement des modulations sur la page Scénarios.
+SCENARIO_GROUPS = (("Paramètres structurels", ("dynamique", "internat", "mobilite")),
+                   ("Politiques publiques", ("formation", "immigration")),
+                   ("Offre / demande", (MATCH_BLOCK,)))
+SCENARIO_COLUMNS = ["scenario", "bloc", "parametre", "libelle", "valeur"]
+MODE_PREDEFINED, MODE_CREATE, MODE_IMPORT = "Scénarios prédéfinis", "Créer un scénario", "Importer un scénario"
+TRUE_WORDS, FALSE_WORDS = {"oui", "vrai", "true", "1"}, {"non", "faux", "false", "0"}
+
+
+def matching_choices(demand):
+    """Options des listes du rapprochement, lues dans la demande (None si indisponible)."""
+    if demand is None or demand.empty:
+        return None, {}
+    required = {"indicator", "label", "demographic_scenario", "need_scenario"}
+    if not required <= set(demand):
+        raise ValueError("Colonnes de scénarios ou de référentiel absentes de la demande.")
+    indicators = sorted(demand.indicator.unique())
+    labels = demand.drop_duplicates("indicator").set_index("indicator").label.to_dict()
+    return {"demographic_scenario": sorted(demand.demographic_scenario.unique()),
+            "need_scenario": sorted(demand.need_scenario.unique()), "need_indicator": indicators}, labels
+
+
+def matching_defaults(choices, labels):
+    values = dict(MATCH_DEFAULTS)
+    if choices is None:
+        values.update(dict.fromkeys(key for key, _ in MATCH_CHOICES))
+        return values
+    demographic, need, indicators = (choices[key] for key, _ in MATCH_CHOICES)
+    values["demographic_scenario"] = "Central" if "Central" in demographic else demographic[0]
+    values["need_scenario"] = "stable" if "stable" in need else need[0]
+    values["need_indicator"] = next((i for i in indicators if "total" in normalize(labels[i])), indicators[0])
+    return values
+
+
+def make_scenario(name, origin, offre, rapprochement, description=""):
+    return {"nom": name, "origine": origin, "description": description,
+            "offre": deepcopy(offre), "rapprochement": dict(rapprochement)}
+
+
+def predefined_scenarios(registry, context, match_values):
+    """Scénarios illustratifs : seuls les paramètres cités diffèrent du scénario Base."""
+    base = default_parameters(registry)
+    first = context["anchor"] + 1
+    places = {f"region_{code}": 20 for code in REGIONS if code in context["available"]}
+
+    def variant(name, description, **changes):
+        offre = deepcopy(base)
+        for block, values in changes.items():
+            offre[block].update(values)
+        return make_scenario(name, "Prédéfini", offre, match_values, description)
+
+    scenarios = (
+        variant("Base", "Réglages par défaut du modèle : dynamiques départementales et correction de "
+                "l'internat actives, aucune hausse de places ni d'arrivées étrangères au-delà de la tendance."),
+        variant("Hausse des places de formation",
+                f"+20 % de places en deuxième année dans chaque région de formation calibrée, à partir de la "
+                f"rentrée {first} ; premières installations en {first + STUDY_YEARS}.",
+                formation={**places, "rentree": first}),
+        variant("Attractivité internationale",
+                f"+30 % d'arrivées de psychiatres diplômés à l'étranger chaque année dès {first}, sans délai.",
+                immigration={"hausse": 30, "debut": first}),
+        variant("Sans correction de l'internat",
+                "Aucune dégradation future du remplissage de l'internat : toutes les cohortes conservent "
+                f"le taux observé en {context['anchor']}.", internat={"active": False}),
+    )
+    return {scenario["nom"]: scenario for scenario in scenarios}
+
+
+def complete_matching(scenario, defaults):
+    """Compléter les listes offre/demande d'un scénario créé sans données de demande."""
+    result = deepcopy(scenario)
+    for key, _ in MATCH_CHOICES:
+        if result["rapprochement"].get(key) is None:
+            result["rapprochement"][key] = defaults[key]
+    return result
+
+
+def check_scenario(scenario, registry, choices):
+    validate_parameters(scenario["offre"], registry)
+    match = scenario["rapprochement"]
+    validate_match_parameters(match)
+    if choices is not None:
+        for key, label in MATCH_CHOICES:
+            if match.get(key) not in choices[key]:
+                raise ValueError(f"Valeur inconnue pour « {label} » : {match.get(key)!r}.")
+
+
+def scenario_rows(scenario, registry):
+    """Une ligne par paramètre, dans l'ordre de la page Scénarios."""
+    rows = []
     for modulation in registry:
-        if not modulation.controls:
-            draft[modulation.key] = {}
-            continue
-        st.subheader(modulation.label)
-        st.caption(modulation.description)
-        values = {}
         for control in modulation.controls:
-            value = applied.get(modulation.key, {}).get(control.key, control.default)
-            common = {"label": control.label, "key": f"param_{modulation.key}_{control.key}",
-                      "disabled": control.disabled, "help": control.help or None}
-            if control.kind == "slider":
-                value = st.slider(**common, min_value=control.minimum, max_value=control.maximum, value=value, step=control.step)
-            elif control.kind == "number":
-                value = st.number_input(**common, min_value=control.minimum, max_value=control.maximum, value=value, step=control.step)
-            elif control.kind == "checkbox":
-                value = st.checkbox(**common, value=value)
-            elif control.kind == "select":
-                value = st.selectbox(**common, options=control.options, index=control.options.index(value))
+            rows.append({"bloc": modulation.key, "parametre": control.key,
+                         "libelle": f"{modulation.label} — {control.label}",
+                         "valeur": scenario["offre"][modulation.key][control.key]})
+    match = scenario["rapprochement"]
+    for key, label in MATCH_CHOICES:
+        rows.append({"bloc": MATCH_BLOCK, "parametre": key, "libelle": f"{MATCH_BLOCK_LABEL} — {label}", "valeur": match.get(key)})
+    for key, label, *_ in MATCH_CONTROLS:
+        rows.append({"bloc": MATCH_BLOCK, "parametre": key, "libelle": f"{MATCH_BLOCK_LABEL} — {label}", "valeur": match[key]})
+    return rows
+
+
+def export_value(value):
+    if isinstance(value, bool):
+        return "oui" if value else "non"
+    if isinstance(value, float):
+        return f"{value:.12g}"
+    return "" if value is None else str(value)
+
+
+def display_value(value, labels=None):
+    if isinstance(value, bool):
+        return "oui" if value else "non"
+    if isinstance(value, (int, float)):
+        return f"{value:g}".replace(".", ",")
+    return (labels or {}).get(value, "—" if value is None else str(value))
+
+
+def scenario_table(scenario, registry):
+    table = pd.DataFrame(scenario_rows(scenario, registry))
+    table["valeur"] = table.valeur.map(export_value)
+    table.insert(0, "scenario", scenario["nom"])
+    return table[SCENARIO_COLUMNS]
+
+
+def scenario_csv(scenario, registry):
+    """Point-virgule et BOM UTF-8 : le fichier s'ouvre directement dans Excel en français."""
+    return scenario_table(scenario, registry).to_csv(sep=";", index=False).encode("utf-8-sig")
+
+
+def scenario_file_name(scenario):
+    stem = re.sub(r"[^a-z0-9]+", "_", unicodedata.normalize("NFKD", scenario["nom"].lower())
+                  .encode("ascii", "ignore").decode()).strip("_") or "scenario"
+    return f"scenario_{stem}.csv"
+
+
+def scenario_differences(scenario, reference, registry, labels=None):
+    """Libellés et valeurs des paramètres qui diffèrent du scénario de référence."""
+    changed, regions = [], []
+    for row, base in zip(scenario_rows(scenario, registry), scenario_rows(reference, registry)):
+        if row["valeur"] == base["valeur"]:
+            continue
+        if row["bloc"] == "formation" and row["parametre"].startswith("region_"):
+            regions.append(row)
+            continue
+        changed.append(f"{row['libelle'].rsplit(' — ', 1)[1]} : {display_value(row['valeur'], labels)}")
+    # Les curseurs régionaux identiques sont résumés en une seule ligne.
+    values = {row["valeur"] for row in regions}
+    if len(regions) > 3 and len(values) == 1:
+        changed.insert(0, f"Hausse des places de formation : +{values.pop()} % dans {len(regions)} régions")
+    else:
+        changed[:0] = [f"Places — {row['libelle'].rsplit(' — ', 1)[1]} : {display_value(row['valeur'])}" for row in regions]
+    return changed
+
+
+def parse_number(text, integer):
+    cleaned = re.sub(r"[\s  ]", "", str(text)).replace(",", ".")
+    value = float(cleaned)
+    if not np.isfinite(value):
+        raise ValueError
+    if integer:
+        if value != int(value):
+            raise ValueError
+        return int(value)
+    return value
+
+
+def convert_control(control, text):
+    if control.kind == "checkbox":
+        word = normalize(text)
+        if word in TRUE_WORDS or word in FALSE_WORDS:
+            return word in TRUE_WORDS
+        raise ValueError
+    if control.kind == "select":
+        if text not in control.options:
+            raise ValueError
+        return text
+    integer = isinstance(control.default, int) and not isinstance(control.default, bool)
+    return parse_number(text, integer)
+
+
+def parse_scenario_file(data, registry, reference, choices):
+    """Lire un CSV exporté (séparateur , ou ; et décimales à virgule acceptés)."""
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = data.decode("latin-1")
+    try:
+        table = pd.read_csv(StringIO(text), sep=None, engine="python", dtype=str, keep_default_na=False)
+    except (pd.errors.ParserError, csv.Error) as exc:
+        raise ValueError(f"Fichier illisible : {exc}") from exc
+    table.columns = [normalize(column) for column in table.columns]
+    missing = {"bloc", "parametre", "valeur"} - set(table.columns)
+    if missing:
+        raise ValueError("Colonnes absentes : " + ", ".join(sorted(missing)) + ". Utiliser le format exporté par l'application.")
+    table = table.apply(lambda column: column.str.strip())
+    table = table[(table.bloc != "") | (table.parametre != "")]
+    if table.empty:
+        raise ValueError("Le fichier ne contient aucun paramètre.")
+    duplicates = table[table.duplicated(["bloc", "parametre"], keep=False)]
+    if not duplicates.empty:
+        raise ValueError("Paramètres répétés : " + ", ".join(sorted(set(duplicates.bloc + "/" + duplicates.parametre))) + ".")
+    controls = {(m.key, c.key): c for m in registry for c in m.controls}
+    choice_keys = {key for key, _ in MATCH_CHOICES}
+    number_keys = {key: (label, low, high) for key, label, low, high, *_ in MATCH_CONTROLS}
+    known = set(controls) | {(MATCH_BLOCK, key) for key in choice_keys | set(number_keys)}
+    unknown = [f"{b}/{p}" for b, p in zip(table.bloc, table.parametre) if (b, p) not in known]
+    if unknown:
+        raise ValueError("Paramètres inconnus : " + ", ".join(unknown[:8]) + ".")
+    names = [value for value in table.get("scenario", pd.Series(dtype=str)) if value]
+    scenario = make_scenario(names[0] if names else "Scénario importé", "Importé",
+                             reference["offre"], reference["rapprochement"])
+    for row in table.itertuples(index=False):
+        try:
+            if (row.bloc, row.parametre) in controls:
+                scenario["offre"][row.bloc][row.parametre] = convert_control(controls[(row.bloc, row.parametre)], row.valeur)
+            elif row.parametre in choice_keys:
+                scenario["rapprochement"][row.parametre] = row.valeur
             else:
-                raise ValueError(f"Contrôle inconnu : {control.kind}.")
-            values[control.key] = value
-        draft[modulation.key] = values
-    return draft
+                scenario["rapprochement"][row.parametre] = parse_number(row.valeur, False)
+        except (ValueError, TypeError):
+            raise ValueError(f"Valeur invalide pour {row.bloc}/{row.parametre} : {row.valeur!r}.") from None
+    absent = sorted(known - set(zip(table.bloc, table.parametre)))
+    warnings = []
+    if absent:
+        warnings.append(f"{len(absent)} paramètre(s) absent(s) du fichier : valeurs du scénario Base conservées ("
+                        + ", ".join(f"{b}/{p}" for b, p in absent[:6]) + ("…" if len(absent) > 6 else "") + ").")
+    check_scenario(scenario, registry, choices)
+    return scenario, warnings
+
+
+def scenario_highlights(scenario, context, labels):
+    """Résumé lisible du scénario, pour la barre latérale et l'en-tête des projections."""
+    offre, anchor = scenario["offre"], context["anchor"]
+    lines = [("Dynamiques départementales : actives, estimées sur "
+              f"{offre['dynamique']['debut']}–{anchor}") if offre["dynamique"]["active"] else "Dynamiques départementales : désactivées",
+             (f"Correction de l'internat : active, tendance depuis {offre['internat']['debut']}")
+             if offre["internat"]["active"] else "Correction de l'internat : désactivée"]
+    places = [offre["formation"][f"region_{code}"] for code in REGIONS if offre["formation"].get(f"region_{code}")]
+    if places:
+        size = f"+{places[0]} %" if len(set(places)) == 1 else f"de +{min(places)} à +{max(places)} %"
+        first = offre["formation"]["rentree"] + offre["formation"]["delai"]
+        lines.append(f"Places de formation : {size} dans {len(places)} région(s), rentrée "
+                     f"{offre['formation']['rentree']}, installations dès {first}")
+    else:
+        lines.append("Places de formation : aucune hausse")
+    hausse = offre["immigration"]["hausse"]
+    lines.append(f"Diplômés à l'étranger : +{hausse} % dès {offre['immigration']['debut']}"
+                 if hausse else "Diplômés à l'étranger : tendance seule")
+    lines.append(f"Départs à la retraite : {display_value(offre['mobilite']['retraite'])} % par an")
+    match = scenario["rapprochement"]
+    if match.get("need_indicator"):
+        lines.append(f"Offre / demande : {labels.get(match['need_indicator'], match['need_indicator'])}, Insee "
+                     f"{match['demographic_scenario']}, besoin {match['need_scenario']}, couverture "
+                     f"{display_value(match['couverture'])} %")
+    return lines
+
+
+# ---------- Éditeur de scénario : widgets alimentés par un brouillon de session ----------
+# Streamlit efface l'état d'un widget absent de la page affichée. Le brouillon
+# (st.session_state.scenario_draft) conserve donc les valeurs entre les pages.
+def widget_key(block, parameter):
+    return f"edit__{block}__{parameter}"
+
+
+def write_widgets(scenario, registry):
+    """Recopier un scénario dans les widgets de l'éditeur (appelé avant leur affichage)."""
+    st.session_state.scenario_draft = make_scenario(scenario["nom"], "Personnalisé",
+                                                    scenario["offre"], scenario["rapprochement"])
+    st.session_state[widget_key("meta", "nom")] = scenario["nom"]
+    for modulation in registry:
+        for control in modulation.controls:
+            st.session_state[widget_key(modulation.key, control.key)] = scenario["offre"][modulation.key][control.key]
+    for key, _ in MATCH_CHOICES:
+        st.session_state[widget_key(MATCH_BLOCK, key)] = scenario["rapprochement"].get(key)
+    for key, *_ in MATCH_CONTROLS:
+        st.session_state[widget_key(MATCH_BLOCK, key)] = float(scenario["rapprochement"][key])
+
+
+def scenario_from_widgets(registry):
+    draft = st.session_state.scenario_draft
+    value = lambda block, key, fallback: st.session_state.get(widget_key(block, key), fallback)
+    offre = {m.key: {c.key: value(m.key, c.key, draft["offre"][m.key][c.key]) for c in m.controls} for m in registry}
+    match = {key: value(MATCH_BLOCK, key, draft["rapprochement"].get(key))
+             for key in [k for k, _ in MATCH_CHOICES] + [k for k, *_ in MATCH_CONTROLS]}
+    name = (value("meta", "nom", draft["nom"]) or "").strip() or "Scénario personnalisé"
+    return make_scenario(name, "Personnalisé", offre, match)
+
+
+def seed_widget(key, value):
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+def render_control(control, block):
+    key = widget_key(block, control.key)
+    seed_widget(key, st.session_state.scenario_draft["offre"][block][control.key])
+    common = {"label": control.label, "key": key, "disabled": control.disabled, "help": control.help or None}
+    if control.kind == "slider":
+        st.slider(**common, min_value=control.minimum, max_value=control.maximum, step=control.step)
+    elif control.kind == "number":
+        st.number_input(**common, min_value=control.minimum, max_value=control.maximum, step=control.step)
+    elif control.kind == "checkbox":
+        st.checkbox(**common)
+    elif control.kind == "select":
+        st.selectbox(**common, options=control.options)
+    else:
+        raise ValueError(f"Contrôle inconnu : {control.kind}.")
+
+
+def set_all_regions(registry):
+    value = st.session_state["edit_all_regions"]
+    formation = next(m for m in registry if m.key == "formation")
+    for control in formation.controls:
+        if control.key.startswith("region_") and not control.disabled:
+            st.session_state[widget_key("formation", control.key)] = value
+
+
+def render_modulation(modulation, registry):
+    with st.container(border=True):
+        st.markdown(f"**{modulation.label}**")
+        if modulation.description:
+            st.caption(modulation.description)
+        if modulation.key != "formation":
+            columns = st.columns(2)
+            for index, control in enumerate(modulation.controls):
+                with columns[index % 2]:
+                    render_control(control, modulation.key)
+            return
+        general = [c for c in modulation.controls if not c.key.startswith("region_")]
+        regional = [c for c in modulation.controls if c.key.startswith("region_")]
+        columns = st.columns(2)
+        for column, control in zip(columns, general):
+            with column:
+                render_control(control, modulation.key)
+        st.markdown("Hausse annuelle permanente des places par région de formation (%)")
+        left, right = st.columns([3, 2], vertical_alignment="bottom")
+        left.slider("Appliquer la même hausse à toutes les régions calibrées (%)", 0, 100, 0, 1, key="edit_all_regions")
+        right.button("Appliquer à toutes les régions", on_click=set_all_regions, args=(registry,), width="stretch")
+        columns = st.columns(3)
+        for index, control in enumerate(regional):
+            with columns[index % 3]:
+                render_control(control, modulation.key)
+
+
+def render_matching_editor(choices, labels, has_activity):
+    if choices is None:
+        st.info("Les données de demande sont indisponibles : seuls les paramètres d'activité sont enregistrés. "
+                "Le rapprochement sera calculé lorsque demand_projection/ et dataDemand/ seront présents.")
+    draft = st.session_state.scenario_draft["rapprochement"]
+    with st.container(border=True):
+        st.markdown(f"**{MATCH_BLOCK_LABEL}**")
+        st.caption("Un seul indicateur de besoin est utilisé : le total et ses composantes ne sont jamais additionnés. "
+                   "Ces hypothèses sont distinctes du référentiel de prévalence.")
+        if choices is not None:
+            columns = st.columns(3)
+            for column, (key, label) in zip(columns, MATCH_CHOICES):
+                widget = widget_key(MATCH_BLOCK, key)
+                if st.session_state.get(widget, draft.get(key)) not in choices[key]:
+                    st.session_state.pop(widget, None)
+                    draft[key] = matching_defaults(choices, labels)[key]
+                seed_widget(widget, draft.get(key))
+                column.selectbox(label, choices[key], key=widget,
+                                 format_func=(lambda value: labels.get(value, value)) if key == "need_indicator" else str)
+        columns = st.columns(3)
+        for index, (key, label, low, high, step, help_text) in enumerate(MATCH_CONTROLS):
+            widget = widget_key(MATCH_BLOCK, key)
+            seed_widget(widget, float(draft[key]))
+            columns[index % 3].number_input(label, min_value=low, max_value=high, step=step, key=widget, help=help_text)
+        if has_activity:
+            st.caption("Projection d'activité fournie : les trois paramètres de productivité sont remplacés par ses valeurs.")
 
 
 @st.cache_data(persist=None)
@@ -1400,23 +1771,6 @@ def calibration_table(reference, context, scenario, parameters, flows, routing, 
                         f"Psychiatres métro. en plus en {first} pour +1 %": additions if available else np.nan,
                         f"X (%) du total métro. en {first} pour +1 %": 100 * additions / national if available and national > 0 else np.nan})
     return pd.DataFrame(records)
-
-
-def installation_share_figure(observed, projected, labels, title, anchor):
-    figure = go.Figure()
-    for index, destination in enumerate(sorted(projected.destination.unique())):
-        color = px.colors.qualitative.Dark24[index % 24]
-        name = labels.get(destination, destination)
-        for frame, dash, legend in ((observed, "solid", True), (projected, "dash", False)):
-            series = frame[frame.destination == destination].sort_values("annee")
-            figure.add_trace(go.Scatter(x=series.annee, y=100 * series.part, mode="lines",
-                name=name, legendgroup=destination, showlegend=legend, line={"color": color, "dash": dash},
-                hovertemplate="%{x} : %{y:.2f} %<extra>%{fullData.name}</extra>"))
-    figure.add_vline(x=anchor, line_dash="dot", line_color="#94a3b8")
-    figure.update_layout(title=title, height=500, yaxis_range=[0, 100],
-        xaxis_title="Année d’installation", yaxis_title="Part des nouveaux arrivants (%)",
-        legend_title="Région d’exercice", hovermode="x unified")
-    return figure
 
 
 def status_figure(panel, context, scenario, departments):
@@ -1800,69 +2154,39 @@ def match_projections_frame(detail):
     return result[COLUMNS].sort_values(COLUMNS[:-1]).reset_index(drop=True)
 
 
-def read_optional_match_csv(upload, path):
-    if upload is not None:
-        return pd.read_csv(BytesIO(upload.getvalue()), dtype=str)
+OPTIONAL_FILES = {
+    "population": ("Population totale tous âges (CSV, si absente des données de demande)", TOTAL_POPULATION_PATH),
+    "activity": ("Projection d’actes par psychiatre (CSV, facultatif)", ACTIVITY_PROJECTION_PATH),
+}
+
+
+def read_optional_match_csv(data, path):
+    """Fichier chargé dans la session, sinon fichier local, sinon None."""
+    if data is not None:
+        return pd.read_csv(BytesIO(data), dtype=str)
     if path.exists():
         return pd.read_csv(path, dtype=str)
     return None
 
 
-def render_matching_controls(demand, context):
-    """Formulaire distinct : une modification de demande ne relance pas l'offre."""
-    with st.sidebar.expander("Paramètres offre / demande", expanded=False):
-        if demand is None or demand.empty:
-            st.info("Le rapprochement nécessite les données de demande. Les projections d'effectifs restent disponibles.")
-            return None, None, None
-        required = {"indicator", "label", "demographic_scenario", "need_scenario"}
-        if not required <= set(demand):
-            raise ValueError("Colonnes de scénarios ou de référentiel absentes de la demande.")
-        indicators = sorted(demand.indicator.unique())
-        labels = demand.drop_duplicates("indicator").set_index("indicator").label.to_dict()
-        defaults = {**MATCH_DEFAULTS,
-            "demographic_scenario": "Central" if "Central" in set(demand.demographic_scenario) else sorted(demand.demographic_scenario.unique())[0],
-            "need_scenario": "stable" if "stable" in set(demand.need_scenario) else sorted(demand.need_scenario.unique())[0],
-            "need_indicator": next((i for i in indicators if "total" in normalize(labels[i])), indicators[0])}
-        choices = {"demographic_scenario": sorted(demand.demographic_scenario.unique()),
-                   "need_scenario": sorted(demand.need_scenario.unique()), "need_indicator": indicators}
-        if st.session_state.get("match_parameter_source") != st.session_state.get("parameter_source"):
-            for key in list(st.session_state):
-                if key.startswith("match_param_"):
-                    del st.session_state[key]
-            st.session_state.match_applied_parameters = defaults
-            st.session_state.match_parameter_source = st.session_state.get("parameter_source")
-        applied = deepcopy(st.session_state.get("match_applied_parameters", defaults))
-        for name, options in choices.items():
-            if applied.get(name) not in options:
-                applied[name] = defaults[name]
-                st.session_state.pop("match_param_" + name, None)
-        with st.form("matching_parameters"):
-            draft = {}
-            for name, title in [("demographic_scenario", "Scénario Insee du rapprochement"), ("need_scenario", "Scénario de besoin du rapprochement"), ("need_indicator", "Besoin de référence")]:
-                draft[name] = st.selectbox(title, choices[name], index=choices[name].index(applied[name]),
-                    format_func=(lambda value: labels[value]) if name == "need_indicator" else str, key="match_param_" + name)
-            st.caption("Un seul indicateur de besoin est utilisé : le total et ses composantes ne sont jamais additionnés.")
-            controls = [
-                ("actes_liberal", "Consultations annuelles par psychiatre libéral ou mixte", 0.0, 20000.0, 50.0, "Valeur initiale approximative CNAM 2024 : 2 515 consultations et téléconsultations par praticien. Portée en 2026 par convention."),
-                ("ratio_salarie", "Activité salariée / activité libérale", 0.0, 2.0, 0.05, "Hypothèse initiale de 0,65, conversion en actes équivalents ; ajustable, ce n'est pas une mesure actuelle de toute l'activité hospitalière."),
-                ("croissance_activite", "Évolution annuelle de l'activité par psychiatre (%)", -5.0, 5.0, 0.1, "0 % maintient la productivité de référence. Une projection d'activité fournie remplace ces trois paramètres."),
-                ("actes_par_besoin", "Actes annuels par personne ciblée", 0.0, 100.0, 1.0, "Hypothèse initiale : 8 actes équivalents par an. Ordre de grandeur descriptif, pas une recommandation clinique par trouble."),
-                ("couverture", "Couverture cible du besoin par un psychiatre (%)", 0.0, 100.0, 5.0, "Part des personnes avec besoin potentiel ciblée par un suivi psychiatrique. 25 % est une hypothèse de scénario, pas un taux observé."),
-                ("part_offre", "Part des actes mobilisable pour ce besoin (%)", 0.0, 100.0, 5.0, "50 % est une hypothèse de scénario pour réserver une part de l'activité aux troubles et âges hors référentiel. Ce paramètre évite d'affecter implicitement toute l'offre à un seul besoin.")]
-            for name, label, low, high, step, help_text in controls:
-                draft[name] = st.number_input(label, min_value=low, max_value=high, value=float(applied[name]), step=step, key="match_param_" + name, help=help_text)
-            submit = st.form_submit_button("Valider l’offre / demande")
-        proposed = draft if submit else applied
-        validate_match_parameters(proposed)
-        st.session_state.match_applied_parameters = deepcopy(proposed)
-        st.caption("Les paramètres de rapprochement prennent effet après validation. Les hypothèses de besoin sont distinctes du référentiel de prévalence.")
-        pop_file = st.file_uploader("Population totale tous âges (CSV, si absente des données de demande)", type="csv", key="match_population_upload")
-        activity_file = st.file_uploader("Projection d’actes par psychiatre (CSV, facultatif)", type="csv", key="match_activity_upload")
-        population = read_optional_match_csv(pop_file, TOTAL_POPULATION_PATH)
-        activity = read_optional_match_csv(activity_file, ACTIVITY_PROJECTION_PATH)
-        if activity is not None:
-            st.caption("Projection d'activité fournie : les paramètres de productivité ci-dessus sont remplacés par ses valeurs, sans multiplicateur supplémentaire.")
-        return proposed, population, activity
+def optional_match_inputs():
+    """Le contenu des fichiers chargés est gardé en session, même hors de la page Scénarios."""
+    stored = st.session_state.get("optional_files", {})
+    return tuple(read_optional_match_csv(stored.get(name, (None, None))[1], path)
+                 for name, (_, path) in OPTIONAL_FILES.items())
+
+
+def store_optional_file(name):
+    upload = st.session_state.get(f"upload_{name}")
+    files = st.session_state.setdefault("optional_files", {})
+    if upload is None:
+        files.pop(name, None)
+    else:
+        files[name] = (upload.name, upload.getvalue())
+
+
+def forget_optional_file(name):
+    st.session_state.setdefault("optional_files", {}).pop(name, None)
 
 
 def ensure_matching(state, demand, population, parameters, context, activity=None):
@@ -1886,7 +2210,7 @@ def render_match_tab(matching, error, scenario, year, names):
     st.write("Le solde compare des actes annuels équivalents de consultation pour le besoin sélectionné : (actes disponibles − actes nécessaires) / population totale du département.")
     st.caption("Un solde négatif indique un manque ; un solde positif indique une marge théorique dans le périmètre choisi. Il ne mesure pas des rendez-vous réellement libres ni un excédent pour l'ensemble de la psychiatrie.")
     if matching is None:
-        st.info(error or "Renseigner les données et paramètres de rapprochement dans la barre latérale.")
+        st.info(error or "Renseigner les données et paramètres de rapprochement sur la page Scénarios.")
         return
     params = matching["parameters"]
     st.caption(f"Paramètres validés : scénario Insee {params['demographic_scenario']} ; besoin {params['need_scenario']} / {params['need_indicator']} ; {params['actes_par_besoin']:g} actes par personne ciblée, couverture {params['couverture']:g} %, offre mobilisable {params['part_offre']:g} %.")
@@ -1919,162 +2243,376 @@ def render_match_tab(matching, error, scenario, year, names):
             st.markdown(f"[{label}]({url})")
 
 
-def main():
-    st.set_page_config(page_title="Projections psychiatres", layout="wide")
+# ---------- Interface : navigation, page Scénarios, page Projections ----------
+FAMILY_SUPPLY, FAMILY_DEMAND, FAMILY_MATCH = "Offre", "Demande", "Offre / demande"
+DEMAND_MEASURES = {"count": "personnes avec besoin potentiel", "rate": "pour 1 000 habitants"}
+
+
+def keep_selection(key):
+    """Un contrôle segmenté ne peut pas être vidé : on rétablit le dernier choix."""
+    if st.session_state.get(key) is None:
+        st.session_state[key] = st.session_state.get(f"{key}__last")
+    st.session_state[f"{key}__last"] = st.session_state[key]
+
+
+def segmented(label, options, key, **kwargs):
+    if st.session_state.get(key) not in options:
+        st.session_state[key] = options[0]
+    st.session_state.setdefault(f"{key}__last", st.session_state[key])
+    return st.segmented_control(label, options, key=key, on_change=keep_selection, args=(key,), **kwargs)
+
+
+def apply_scenario(scenario, registry, choices, from_widgets=False):
+    """Bouton « Appliquer » : vérifier, activer, puis afficher les projections."""
+    if from_widgets:
+        scenario = scenario_from_widgets(registry)
+        st.session_state.scenario_draft = deepcopy(scenario)
+    try:
+        check_scenario(scenario, registry, choices)
+    except (ValueError, KeyError) as exc:
+        st.session_state.scenario_error = f"Scénario non appliqué : {exc}"
+        return
+    st.session_state.scenario_previous = st.session_state.scenario_active
+    st.session_state.scenario_active = deepcopy(scenario)
+    st.session_state.goto_projections = True
+
+
+def edit_scenario(scenario, registry, name=None):
+    """Charger un scénario dans l'éditeur et ouvrir la création."""
+    copy = deepcopy(scenario)
+    if name:
+        copy["nom"] = name
+    write_widgets(copy, registry)
+    st.session_state.scenario_mode = MODE_CREATE
+    st.session_state.scenario_mode__last = MODE_CREATE
+
+
+def render_sidebar_summary(scenario, context, labels):
+    with st.sidebar:
+        st.caption("SCÉNARIO ACTIF")
+        st.markdown(f"**{scenario['nom']}**  \n:gray[{scenario['origine']}]")
+        st.caption("  \n".join(scenario_highlights(scenario, context, labels)))
+
+
+def render_scenarios_page(app, projections_page):
+    if st.session_state.pop("goto_projections", False):
+        st.switch_page(projections_page)
+    registry, context, choices, labels = app["registry"], app["context"], app["choices"], app["labels"]
+    predefined, active = app["predefined"], st.session_state.scenario_active
+    st.title("Scénarios")
+    st.write("Choisissez les paramètres structurels et les politiques publiques utilisés pour les projections. "
+             "Un scénario appliqué est recalculé pour votre session, puis affiché dans Projections.")
+    if "scenario_error" in st.session_state:
+        st.error(st.session_state.pop("scenario_error"))
+    with st.container(border=True):
+        left, right = st.columns([4, 1], vertical_alignment="center")
+        left.markdown(f"Scénario actif : **{active['nom']}** · :gray[{active['origine']}]")
+        left.caption(" · ".join(scenario_highlights(active, context, labels)))
+        right.download_button("Exporter (.csv)", scenario_csv(active, registry), scenario_file_name(active),
+                              "text/csv", key="export_active", width="stretch")
+    mode = segmented("Mode", [MODE_PREDEFINED, MODE_CREATE, MODE_IMPORT], "scenario_mode", label_visibility="collapsed")
+    if mode == MODE_PREDEFINED:
+        render_predefined(predefined, active, registry, choices, labels)
+    elif mode == MODE_CREATE:
+        render_creation(app)
+    else:
+        render_import(app)
+    with st.expander("Données facultatives pour le rapprochement offre / demande"):
+        st.caption("Ces fichiers s'appliquent à tous les scénarios de la session et ne sont pas inclus dans l'export. "
+                   "Une projection d'activité remplace les trois paramètres de productivité.")
+        stored = st.session_state.get("optional_files", {})
+        for name, (label, path) in OPTIONAL_FILES.items():
+            st.file_uploader(label, type="csv", key=f"upload_{name}", on_change=store_optional_file, args=(name,))
+            if name in stored and st.session_state.get(f"upload_{name}") is None:
+                info, remove = st.columns([4, 1], vertical_alignment="center")
+                info.caption(f"Fichier utilisé : {stored[name][0]}")
+                remove.button("Retirer", key=f"forget_{name}", on_click=forget_optional_file, args=(name,))
+            elif name not in stored and path.exists():
+                st.caption(f"Fichier local utilisé : {path.relative_to(ROOT)}")
+
+
+def render_predefined(predefined, active, registry, choices, labels):
+    st.caption("Scénarios illustratifs, construits à partir des leviers du modèle. "
+               "« Personnaliser » les copie dans l'éditeur pour les ajuster.")
+    base = predefined["Base"]
+    columns = st.columns(2)
+    for index, scenario in enumerate(predefined.values()):
+        with columns[index % 2].container(border=True):
+            is_active = active["origine"] == "Prédéfini" and active["nom"] == scenario["nom"]
+            st.markdown(f"#### {scenario['nom']}" + ("  :green-badge[Actif]" if is_active else ""))
+            st.write(scenario["description"])
+            changes = scenario_differences(scenario, base, registry, labels)
+            st.caption("  \n".join(changes) if changes else "Valeurs par défaut du modèle.")
+            apply, edit, export = st.columns(3)
+            apply.button("Appliquer", key=f"apply_{index}", type="primary", width="stretch",
+                         on_click=apply_scenario, args=(scenario, registry, choices))
+            edit.button("Personnaliser", key=f"edit_{index}", width="stretch",
+                        on_click=edit_scenario, args=(scenario, registry, f"{scenario['nom']} (personnalisé)"))
+            export.download_button("Exporter", scenario_csv(scenario, registry), scenario_file_name(scenario),
+                                   "text/csv", key=f"export_{index}", width="stretch")
+
+
+def render_creation(app):
+    registry, choices, labels, predefined = app["registry"], app["choices"], app["labels"], app["predefined"]
+    st.caption("Les valeurs ne sont prises en compte qu'au clic sur « Appliquer ». Le brouillon est conservé "
+               "pendant la session, même en passant par la page Projections.")
+    starts = {**predefined, "Scénario actif": st.session_state.scenario_active}
+    name_col, start_col, load_col = st.columns([2, 2, 1], vertical_alignment="bottom")
+    with name_col:
+        seed_widget(widget_key("meta", "nom"), st.session_state.scenario_draft["nom"])
+        st.text_input("Nom du scénario", key=widget_key("meta", "nom"), max_chars=80)
+    start = start_col.selectbox("Partir des valeurs de", list(starts), key="edit_start")
+    load_col.button("Charger", width="stretch", on_click=edit_scenario,
+                    args=(starts[start], registry, st.session_state.get(widget_key("meta", "nom"))),
+                    help="Remplace les valeurs de l'éditeur par celles du scénario choisi, en gardant le nom.")
+    by_key = {m.key: m for m in registry}
+    for tab, (_, blocks) in zip(st.tabs([label for label, _ in SCENARIO_GROUPS]), SCENARIO_GROUPS):
+        with tab:
+            for block in blocks:
+                if block == MATCH_BLOCK:
+                    render_matching_editor(choices, labels, optional_match_inputs()[1] is not None)
+                elif by_key[block].controls:
+                    render_modulation(by_key[block], registry)
+    draft = scenario_from_widgets(registry)
+    st.session_state.scenario_draft = draft
+    try:
+        check_scenario(draft, registry, choices)
+        problem = None
+    except (ValueError, KeyError) as exc:
+        problem = str(exc)
+        st.error(problem)
+    changes = scenario_differences(draft, predefined["Base"], registry, labels)
+    st.caption(("Écarts au scénario Base : " + " · ".join(changes)) if changes else "Identique au scénario Base.")
+    apply, export, _ = st.columns([1, 1, 2])
+    apply.button("Appliquer ce scénario", type="primary", width="stretch", disabled=problem is not None,
+                 on_click=apply_scenario, args=(draft, registry, choices, True))
+    export.download_button("Exporter (.csv)", scenario_csv(draft, registry), scenario_file_name(draft),
+                           "text/csv", key="export_draft", width="stretch", disabled=problem is not None)
+
+
+def render_import(app):
+    registry, choices, labels, base = app["registry"], app["choices"], app["labels"], app["predefined"]["Base"]
+    st.caption("Charger un fichier exporté par l'application. Les paramètres absents prennent la valeur du "
+               "scénario Base ; toute valeur hors limites est refusée.")
+    upload = st.file_uploader("Fichier de scénario (.csv)", type="csv", key="scenario_upload")
+    with st.expander("Format attendu"):
+        st.write("Une ligne par paramètre, séparateur point-virgule ou virgule. Colonnes : "
+                 "`scenario` (nom), `bloc`, `parametre`, `libelle` (indicatif) et `valeur`. "
+                 "Les décimales peuvent utiliser la virgule ; les cases à cocher valent oui ou non.")
+        st.dataframe(scenario_table(base, registry).head(8), hide_index=True, width="stretch")
+        st.download_button("Télécharger un modèle (scénario Base)", scenario_csv(base, registry),
+                           "modele_scenario.csv", "text/csv", key="export_template")
+    if upload is None:
+        return
+    try:
+        scenario, warnings = parse_scenario_file(upload.getvalue(), registry, base, choices)
+    except (ValueError, KeyError) as exc:
+        st.error(f"Import impossible : {exc}")
+        return
+    for message in warnings:
+        st.warning(message)
+    with st.container(border=True):
+        st.markdown(f"#### {scenario['nom']}")
+        st.caption("  \n".join(scenario_highlights(scenario, app["context"], labels)))
+        changes = scenario_differences(scenario, base, registry, labels)
+        st.caption(("Écarts au scénario Base : " + " · ".join(changes)) if changes else "Identique au scénario Base.")
+        apply, edit, _ = st.columns([1, 1, 2])
+        apply.button("Appliquer ce scénario", type="primary", width="stretch", key="apply_import",
+                     on_click=apply_scenario, args=(scenario, registry, choices))
+        edit.button("Modifier avant d'appliquer", width="stretch", key="edit_import",
+                    on_click=edit_scenario, args=(scenario, registry))
+    with st.expander("Valeurs importées"):
+        st.dataframe(scenario_table(scenario, registry), hide_index=True, width="stretch")
+
+
+def demand_map_frame(demand, baseline, match):
+    """Demande du scénario actif, rapprochée des codes départementaux métropolitains."""
+    selected = demand[(demand.demographic_scenario == match["demographic_scenario"])
+                      & (demand.need_scenario == match["need_scenario"])].copy()
+    names = pd.DataFrame({"department": selected.department.unique()})
+    names["dep"] = match_department_codes(names, baseline)
+    selected["dep"] = selected.department.map(names.set_index("department").dep)
+    selected["annee"] = match_years(selected)
+    return selected[selected.dep.isin(set(baseline.dep))]
+
+
+def render_map_tab(app, df, demand, demand_error, matching, matching_error, scenario):
+    """Carte pleine largeur, sélecteurs dessous ; renvoie la projection DREES et l'année choisies."""
+    context, names = app["context"], app["names"]
+    anchor, labels = context["anchor"], app["labels"]
+    map_area = st.container()
+    controls = st.container(border=True)
+    with controls:
+        family_col, indicator_col, drees_col = st.columns([1.6, 2.9, 1.2])
+        with family_col:
+            family = segmented("Thème", [FAMILY_SUPPLY, FAMILY_DEMAND, FAMILY_MATCH], "map_family")
+        demand_rows = None
+        if family == FAMILY_SUPPLY:
+            options = list(INDICATORS.values())
+            indicator = indicator_col.selectbox("Indicateur", options, key="map_indicator_supply")
+            rows = df[df.indicateur == indicator]
+        elif family == FAMILY_MATCH:
+            options = list(MATCH_INDICATORS.values())
+            indicator = indicator_col.selectbox("Indicateur", options, key="map_indicator_match")
+            rows = matching["projections"] if matching is not None else df.iloc[0:0]
+            rows = rows[rows.indicateur == indicator]
+        else:
+            options = [(code, measure) for code in (app["choices"] or {}).get("need_indicator", []) for measure in DEMAND_MEASURES]
+            indicator = indicator_col.selectbox(
+                "Indicateur", options, key="map_indicator_demand",
+                format_func=lambda item: f"{labels.get(item[0], item[0])} — {DEMAND_MEASURES[item[1]]}") if options else None
+            rows = df.iloc[0:0]
+            if indicator is not None and demand is not None:
+                code, measure = indicator
+                demand_rows = demand_map_frame(demand, context["baseline"], scenario["rapprochement"])
+                demand_rows = demand_rows[demand_rows.indicator == code].copy()
+                demand_rows["valeur"] = (demand_rows.persons_with_need if measure == "count"
+                                         else 1000 * demand_rows.persons_with_need / demand_rows.population_total)
+                rows = demand_rows
+        drees_options = sorted(df.scenario.unique())
+        drees = drees_col.selectbox("Projection DREES", drees_options, key="map_drees", disabled=family == FAMILY_DEMAND,
+                                    help="Scénario des projections DREES d'effectifs. Sans effet sur la demande.")
+        years = rows.annee if not rows.empty else df.annee
+        lower, upper = int(years.min()), int(years.max())
+        st.session_state.map_year = max(lower, min(upper, st.session_state.get("map_year", anchor)))
+        year = (st.slider("Année", lower, upper, key="map_year") if lower < upper
+                else st.selectbox("Année", [lower], key="map_year"))
+    if family == FAMILY_DEMAND:
+        unit = DEMAND_MEASURES[indicator[1]] if indicator else ""
+        value_label = f"Besoin potentiel ({unit})"
+        selected = rows[rows.annee == year] if not rows.empty else rows
+        scale_values = rows.valeur if not rows.empty else pd.Series(dtype=float)
+    else:
+        value_label = indicator + " (%)" if indicator == SALARIED_SHARE else indicator
+        selected = rows[(rows.scenario == drees) & (rows.annee == year)]
+        scale_values = rows.valeur
+    selected = selected[["dep", "valeur"]].copy() if not selected.empty else pd.DataFrame(columns=["dep", "valeur"])
+    selected["nom"] = selected.dep.map(names)
+    with map_area:
+        if family == FAMILY_DEMAND and demand is None:
+            st.warning(f"Demande de soins indisponible : {demand_error}" if demand_error else "Demande de soins indisponible.")
+        elif family == FAMILY_MATCH and selected.empty:
+            st.warning(matching_error or "Indicateur disponible uniquement sur la période commune à l'offre, à la demande et à la population totale.")
+        render_choropleth(selected, scale_values, value_label, indicator)
+    with st.expander(f"Valeurs par département en {year}"):
+        if not selected.empty:
+            st.dataframe(selected.sort_values("valeur")[["dep", "nom", "valeur"]].rename(
+                columns={"dep": "Code", "nom": "Département", "valeur": value_label}), hide_index=True, width="stretch")
+    if family == FAMILY_MATCH:
+        st.caption("Rapprochement annuel selon les paramètres offre / demande du scénario actif. Solde négatif : manque d'actes ; positif : marge théorique pour le besoin choisi. La carte est centrée sur zéro pour le solde, sans supprimer les valeurs négatives.")
+        if matching is not None:
+            mp = matching["parameters"]
+            st.caption(f"Référence du rapprochement : Insee {mp['demographic_scenario']} ; besoin {mp['need_scenario']} / {mp['need_indicator']} ; couverture {mp['couverture']:g} %, {mp['actes_par_besoin']:g} actes par personne ciblée, {mp['part_offre']:g} % de l'offre mobilisable.")
+    elif family == FAMILY_DEMAND:
+        match = scenario["rapprochement"]
+        st.caption(f"Personnes avec besoin potentiel = population projetée × prévalence, selon le scénario Insee {match['demographic_scenario']} "
+                   f"et le scénario de besoin {match['need_scenario']} du scénario actif. Le taux rapporte ce nombre à la population totale tous âges. "
+                   "Ce n'est ni un recours observé, ni un nombre de psychiatres requis ; voir l'onglet Demande de soins.")
+    else:
+        st.caption("Salariés = salariés hospitaliers + autres salariés. Libéraux = libéraux exclusifs + exercice mixte. Chaque personne est comptée une seule fois ; la part salariée est en %.")
+    return drees, year
+
+
+def render_choropleth(selected, scale_values, value_label, indicator):
+    try:
+        gj = load_geojson()
+    except (OSError, ValueError) as exc:
+        st.warning(f"Carte indisponible ; les tableaux et les courbes restent accessibles : {exc}")
+        return
+    if selected.empty:
+        return
+    is_share, is_balance = indicator == SALARIED_SHARE, indicator == ACTS_BALANCE
+    if is_balance:
+        bound = max(float(scale_values.abs().quantile(0.98)), 0.001) if not scale_values.empty else 1.0
+        vmin, vmax = -bound, bound
+    else:
+        vmin, vmax = (0.0, 100.0) if is_share else scale_values.quantile([0.02, 0.98]) if not scale_values.empty else (0.0, 1.0)
+    if vmin == vmax:
+        vmax = vmin + 1
+    # Le premier bleu, presque blanc, se confondait avec le fond.
+    fig = px.choropleth(selected, geojson=gj, locations="dep", featureidkey="properties.code", color="valeur",
+                        color_continuous_scale="RdBu" if is_balance else px.colors.sequential.Blues[1:], range_color=(vmin, vmax),
+                        hover_name="nom", custom_data=["dep"], labels={"valeur": value_label})
+    unit = " %" if is_share else ""
+    number_format = "%{z:+.3f} acte/habitant/an" if is_balance else "%{z:,.1f}" + unit
+    fig.update_traces(marker_line_color="white", marker_line_width=0.6,
+                      hovertemplate="<b>%{hovertext}</b> (%{customdata[0]})<br>" + number_format + "<extra></extra>")
+    # Projection conique conforme de Lambert, comme le Lambert 93 officiel :
+    # la France garde ses proportions, au lieu d'être étirée en largeur.
+    fig.update_geos(projection=dict(type="conic conformal", parallels=[44, 49], rotation=dict(lon=3)),
+                    center=dict(lon=2.3, lat=46.3), lonaxis_range=[-5.3, 9.8], lataxis_range=[41.2, 51.2],
+                    visible=False, bgcolor="rgba(0,0,0,0)")
+    fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), height=820, dragmode=False,
+                      paper_bgcolor="rgba(0,0,0,0)", separators=", ",
+                      coloraxis_colorbar=dict(title=dict(text=value_label, side="right"),
+                                              thickness=14, len=0.7, outlinewidth=0))
+    st.plotly_chart(fig, width="stretch")
+
+
+def render_projections_page(app, scenarios_page):
+    reference, metadata, context = app["reference"], app["metadata"], app["context"]
+    signature, names, labels = app["signature"], app["names"], app["labels"]
+    scenario = complete_matching(st.session_state.scenario_active, app["match_defaults"])
+    proposed = scenario["offre"]
     st.title("Projections des effectifs de psychiatres par département")
     try:
-        require_excel_reader()
-        signature = source_signature()
-        with st.spinner("Lecture et calibration des données…"):
-            reference, metadata, context = load_reference(signature)
-    except FileNotFoundError as exc:
-        st.error(f"Fichier absent : {exc.filename}. Placer les deux classeurs à côté de app.py.")
-        st.stop()
-    except (ValueError, KeyError, OSError, RuntimeError) as exc:
-        st.error(str(exc))
-        st.stop()
-    registry = modulation_registry(context)
-    # Un changement de sources/code réinitialise les anciens contrôles, dont
-    # l'ancien curseur national. Un simple changement de filtre ne fait rien.
-    if st.session_state.get("parameter_source") != signature:
-        for key in list(st.session_state):
-            if key.startswith("param_"):
-                del st.session_state[key]
-        st.session_state.applied_parameters = default_parameters(registry)
-        st.session_state.parameter_source = signature
-    with st.sidebar:
-        with st.form("modulations"):
-            draft = render_parameters(st.session_state.applied_parameters, registry)
-            submitted = st.form_submit_button("Valider", type="primary")
-        st.caption("Les modifications prennent effet après Valider. Vos paramètres et résultats sont propres à cette session.")
-    proposed = draft if submitted else st.session_state.applied_parameters
-    try:
-        with st.spinner("Calcul du scénario…"):
+        with st.spinner(f"Calcul du scénario « {scenario['nom']} »…"):
             df, metadata, recalculated = ensure_projections(signature, proposed, reference, metadata, context)
-        st.session_state.applied_parameters = deepcopy(proposed)
     except (ValueError, KeyError, RuntimeError) as exc:
-        st.error(str(exc))
+        failed = scenario["nom"]
+        previous = st.session_state.get("scenario_previous")
+        if previous is not None and previous is not st.session_state.scenario_active:
+            st.session_state.scenario_active = previous
+        st.error(f"Le scénario « {failed} » n'a pas pu être calculé : {exc}")
+        st.page_link(scenarios_page, label="Revenir aux scénarios", icon=":material/tune:")
         st.stop()
     if recalculated:
-        st.success("Projections recalculées pour votre session.")
+        st.toast(f"Projections recalculées : {scenario['nom']}.")
     anchor = context["anchor"]
-    st.caption(f"Observé : {df.annee.min()}–{anchor}. Projeté : {anchor + 1}–{df.annee.max()}.")
-    if metadata["mode_projection"] == "national":
-        st.info(f"Psychiatrie absente des projections régionales : croissance nationale DREES raccordée aux effectifs RPPS de {anchor}.")
-    else:
-        st.caption("Référence issue des projections régionales détaillées de psychiatrie.")
-    if proposed["dynamique"]["active"]:
-        st.caption(f"Paramètres validés : dynamiques des effectifs actives dès {anchor + 1}, estimées sur {proposed['dynamique']['debut']}–{anchor}. Le total national est conservé à cette étape, puis la correction de l’internat et les hausses d'arrivées et de places sont appliquées.")
-    else:
-        st.warning(f"Paramètres validés : dynamiques départementales désactivées. Leur pente n'est pas appliquée. Pour les activer dès {anchor + 1}, cocher la case dans le formulaire puis cliquer sur Valider.")
     state = st.session_state.psy_projection
-    st.caption(f"Répartition validée : {proposed['mobilite']['methode']} ; retraites {proposed['mobilite']['retraite']:.1f} % par an. Places en deuxième année : premières installations en {proposed['formation']['rentree'] + proposed['formation']['delai']}. Code 99 : tendance nationale active dès {anchor + 1}, plus hausse de {proposed['immigration']['hausse']} % dès {proposed['immigration']['debut']}.")
-    if proposed["internat"]["active"]:
-        st.caption(f"Correction nationale des cohortes activée : premiers effets possibles sur les effectifs en {anchor + 1 + DES_YEARS}. Les observations restent inchangées.")
-    else:
-        st.caption("Correction nationale des postes non pourvus désactivée.")
-    demand, demand_error, matching, matching_error = None, None, None, None
+    with st.container(border=True):
+        left, right = st.columns([5, 1], vertical_alignment="center")
+        left.markdown(f"Scénario actif : **{scenario['nom']}** · :gray[{scenario['origine']}]")
+        left.caption(" · ".join(scenario_highlights(scenario, context, labels)))
+        right.page_link(scenarios_page, label="Changer de scénario", icon=":material/tune:")
+    mode_text = (f"croissance nationale DREES raccordée aux effectifs RPPS de {anchor} (psychiatrie absente des projections régionales)"
+                 if metadata["mode_projection"] == "national" else "projections régionales détaillées de psychiatrie")
+    st.caption(f"Observé : {df.annee.min()}–{anchor}. Projeté : {anchor + 1}–{df.annee.max()}. Référence : {mode_text}.")
+    demand, demand_error = app["demand"], app["demand_error"]
+    matching, matching_error = None, None
     try:
-        demand = demand_outcomes()
-    except (OSError, ValueError, KeyError, ImportError) as exc:
-        demand_error = str(exc)
-    try:
-        match_parameters, population, activity = render_matching_controls(demand, context)
-        if match_parameters is not None:
-            matching = ensure_matching(state, demand, population, match_parameters, context, activity)
-            df = pd.concat([df, matching["projections"]], ignore_index=True)
+        if demand is not None:
+            population, activity = optional_match_inputs()
+            matching = ensure_matching(state, demand, population, scenario["rapprochement"], context, activity)
         else:
             matching_error = "Les dossiers demand_projection/ et dataDemand/ doivent être présents pour calculer la demande."
     except (OSError, ValueError, KeyError, TypeError) as exc:
         matching_error = str(exc)
-    with st.sidebar:
-        indicator = st.selectbox("Indicateur", list(INDICATORS.values()) + list(MATCH_INDICATORS.values()))
-        scenario = st.selectbox("Scénario", sorted(df.scenario.unique()))
-        indicator_years = df.loc[df.indicateur == indicator, "annee"]
-        lower = int(indicator_years.min()) if not indicator_years.empty else anchor
-        upper = int(indicator_years.max()) if not indicator_years.empty else int(df.annee.max())
-        st.session_state.map_year = max(lower, min(upper, st.session_state.get("map_year", anchor)))
-        year = (st.slider("Année", lower, upper, key="map_year") if lower < upper
-                else st.selectbox("Année", [lower], key="map_year"))
-        if indicator in MATCH_INDICATORS.values() and not indicator_years.empty:
-            st.caption(f"Actes : données disponibles de {lower} à {upper}.")
-    tab_map, tab_trends, tab_status, tab_internat, tab_mobility, tab_demand, tab_match, tab_method = st.tabs(["Carte et indicateurs", "Dynamiques départementales", "Statuts d’exercice", "Internat national", "Diplômes et installations", "Demande de soins", "Offre / demande", "Calibration et hypothèses"])
-    names = context["baseline"].set_index("dep").nom.to_dict()
+    tab_map, tab_trends, tab_status, tab_internat, tab_demand, tab_match, tab_method = st.tabs(
+        ["Carte et indicateurs", "Dynamiques départementales", "Statuts d’exercice", "Internat national",
+         "Demande de soins", "Offre / demande", "Calibration et hypothèses"])
     with tab_map:
-        selected = df[(df.indicateur == indicator) & (df.scenario == scenario) & (df.annee == year)].copy()
-        selected["nom"] = selected.dep.map(names)
-        if selected.empty and indicator in MATCH_INDICATORS.values():
-            st.warning(matching_error or "Indicateur disponible uniquement sur la période commune à l'offre, à la demande et à la population totale.")
-        try:
-            gj = load_geojson()
-        except (OSError, ValueError) as exc:
-            gj = None
-            st.warning(f"Carte indisponible ; les tableaux et les courbes restent accessibles : {exc}")
-        is_share = indicator == SALARIED_SHARE
-        is_balance = indicator == ACTS_BALANCE
-        value_label = indicator + " (%)" if is_share else indicator
-        values = df.loc[df.indicateur == indicator, "valeur"]
-        if is_balance:
-            bound = max(float(values.abs().quantile(0.98)), 0.001) if not values.empty else 1.0
-            vmin, vmax = -bound, bound
-        else:
-            vmin, vmax = (0.0, 100.0) if is_share else values.quantile([0.02, 0.98]) if not values.empty else (0.0, 1.0)
-        if vmin == vmax:
-            vmax = vmin + 1
-        map_col, table_col = st.columns([2, 1])
-        if gj is not None and not selected.empty:
-            # Le premier bleu, presque blanc, se confondait avec le fond.
-            fig = px.choropleth(selected, geojson=gj, locations="dep", featureidkey="properties.code", color="valeur",
-                                color_continuous_scale="RdBu" if is_balance else px.colors.sequential.Blues[1:], range_color=(vmin, vmax),
-                                hover_name="nom", custom_data=["dep"], labels={"valeur": value_label})
-            unit = " %" if is_share else ""
-            number_format = "%{z:+.3f} acte/habitant/an" if is_balance else "%{z:,.1f}" + unit
-            fig.update_traces(marker_line_color="white", marker_line_width=0.6,
-                              hovertemplate="<b>%{hovertext}</b> (%{customdata[0]})<br>" + number_format + "<extra></extra>")
-            # Projection conique conforme de Lambert, comme le Lambert 93 officiel :
-            # la France garde ses proportions, au lieu d'être étirée en largeur.
-            fig.update_geos(projection=dict(type="conic conformal", parallels=[44, 49], rotation=dict(lon=3)),
-                            center=dict(lon=2.3, lat=46.3), lonaxis_range=[-5.3, 9.8], lataxis_range=[41.2, 51.2],
-                            visible=False, bgcolor="rgba(0,0,0,0)")
-            fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), height=650, dragmode=False,
-                              paper_bgcolor="rgba(0,0,0,0)", separators=", ",
-                              coloraxis_colorbar=dict(title=dict(text=value_label, side="right"),
-                                                      thickness=12, len=0.6, outlinewidth=0))
-            map_col.plotly_chart(fig, width="stretch")
-        if not selected.empty:
-            table_col.dataframe(selected.sort_values("valeur")[["dep", "nom", "valeur"]].rename(columns={"valeur": value_label}), hide_index=True, width="stretch")
-        if indicator in MATCH_INDICATORS.values():
-            st.caption("Rapprochement annuel selon les paramètres validés de l'offre / demande. Solde négatif : manque d'actes ; positif : marge théorique pour le besoin choisi. La carte est centrée sur zéro pour le solde, sans supprimer les valeurs négatives.")
-            if matching is not None:
-                mp = matching["parameters"]
-                st.caption(f"Référence du rapprochement : Insee {mp['demographic_scenario']} ; besoin {mp['need_scenario']} / {mp['need_indicator']} ; couverture {mp['couverture']:g} %, {mp['actes_par_besoin']:g} actes par personne ciblée, {mp['part_offre']:g} % de l'offre mobilisable.")
-        else:
-            st.caption("Salariés = salariés hospitaliers + autres salariés. Libéraux = libéraux exclusifs + exercice mixte. Chaque personne est comptée une seule fois ; la part salariée est en %.")
+        scenario_drees, year = render_map_tab(app, df, demand, demand_error, matching, matching_error, scenario)
+    shown_choice = f"Projection DREES : {scenario_drees} · année {year}, réglables sous la carte."
     with tab_trends:
+        st.caption(shown_choice)
         active = proposed["dynamique"]["active"]
         start = proposed["dynamique"]["debut"]
         if active:
             st.info(f"Dynamique réellement appliquée : OUI, dès {anchor + 1}. Pente d'effectif estimée sur {start}–{anchor} puis raccordée à l'observation {anchor}.")
         else:
             st.warning("Dynamique réellement appliquée : NON. La tendance nationale des arrivées étrangères reste active, même avec le curseur à 0 %. Elle peut produire des écarts territoriaux. Des projections régionales détaillées peuvent aussi avoir leur propre évolution.")
-        st.write(f"Les courbes montrent un écart en nombre de psychiatres. Chaque effectif est comparé au total national après correction de l’internat, avant tendance étrangère et hausses des places ou des arrivées, multiplié par la part du département observée en {anchor}. Cette référence est commune aux deux vues.")
-        view = st.selectbox("Projection affichée", ["Sans ouverture de places", "Avec les ouvertures de places"], key="trend_view")
-        full = view == "Avec les ouvertures de places"
+        st.write(f"Les courbes montrent un écart en nombre de psychiatres. Chaque effectif est comparé au total national après correction de l’internat, avant tendance étrangère et hausses des places ou des arrivées, multiplié par la part du département observée en {anchor}. Les courbes incluent tous les effets du scénario actif, ouvertures de places comprises.")
         show_fit = st.checkbox("Afficher la droite estimée sur les observations", value=False, key="show_trend_fit")
         departments = st.multiselect("Départements à comparer", sorted(names), default=["75"] if "75" in names else [sorted(names)[0]],
-                                     format_func=lambda dep: f"{dep} · {names[dep]}")
+                                     format_func=lambda dep: f"{dep} · {names[dep]}", key="trend_departments")
         if departments:
-            state = st.session_state.psy_projection
-            diagnostic = dynamics_diagnostic(state["panel"], state["contributions"], context, scenario)
-            st.plotly_chart(dynamics_figure(diagnostic, context, departments, full, start, show_fit), width="stretch")
-            if full:
-                has_places = any(proposed["formation"][f"region_{code}"] for code in REGIONS)
-                if has_places:
-                    st.caption(f"Ouvertures validées : premiers effets en {proposed['formation']['rentree'] + proposed['formation']['delai']}. Ce délai concerne les places de formation ; la hausse des arrivées étrangères intervient sans délai.")
-                else:
-                    st.caption("Aucune hausse de places validée : les deux vues coïncident.")
+            diagnostic = dynamics_diagnostic(state["panel"], state["contributions"], context, scenario_drees)
+            st.plotly_chart(dynamics_figure(diagnostic, context, departments, True, start, show_fit), width="stretch")
+            if any(proposed["formation"][f"region_{code}"] for code in REGIONS):
+                st.caption(f"Ouvertures de places du scénario : premiers effets en {proposed['formation']['rentree'] + proposed['formation']['delai']}. Ce délai concerne les places de formation ; la hausse des arrivées étrangères intervient sans délai.")
             else:
-                st.caption("Cette vue exclut les ajouts de places et inclut la tendance des arrivées étrangères ainsi que la hausse validée par le curseur. La carte conserve le scénario complet validé.")
+                st.caption("Aucune hausse de places dans ce scénario.")
             st.caption(f"Trait plein : observations. Tirets : projection. Toutes les courbes valent zéro à l'ancrage {anchor}. Un plat à zéro signifie que l'effectif suit la référence nationale, pas qu'il est constant. Un écart négatif correspond à moins de psychiatres que cette référence. Le filtre Année de la carte ne coupe pas les courbes.")
             if show_fit:
                 st.caption("Les fines lignes pointillées sont les régressions des écarts d'effectif, avec constante. Le futur repart de l'observation réelle et prolonge la pente estimée. La saturation et la renormalisation conservent le total à cette étape ; la correction nationale de l’internat peut ensuite réduire les niveaux et les écarts départementaux.")
@@ -2091,17 +2629,20 @@ def main():
                     columns={"effectif_reference": "Référence sans modulation", "effet_dynamique": "Effet départemental", "effet_internat": "Correction internat",
                              "tendance_etranger": "Tendance étrangère / 2026", "ajout_immigration": "Hausse du curseur étranger", "ajout_formation": "Ajout des places", "effectif": "Effectif final"}), hide_index=True, width="stretch")
                 st.caption("L'effet départemental inclut la saturation et la renormalisation. L'ajout des places est un nombre de psychiatres supplémentaires, toujours positif ou nul.")
+            if state["foreign_trend_limited_rows"]:
+                st.warning("L’écart cumulé des arrivées étrangères aurait rendu certains effectifs départementaux négatifs. Leur correction a été limitée à un effectif nul ; la décomposition montre le retrait effectivement appliqué.")
         else:
             st.info("Sélectionner au moins un département pour afficher les courbes.")
     with tab_status:
+        st.caption(shown_choice)
         st.write(f"La part salariée est estimée séparément pour chaque département par une tendance logistique sur les comptes {context['observed_start']}–{anchor} de l’onglet Effectifs. La projection repart exactement de la part observée en {anchor}.")
         st.caption("Salariés : hospitaliers et autres salariés, hors exercice mixte. Libéraux : libéraux exclusifs et mixtes. Les deux groupes reconstituent toujours l’effectif total.")
         status_departments = st.multiselect("Départements pour les statuts", sorted(names),
                                             default=["75"] if "75" in names else [sorted(names)[0]],
                                             format_func=lambda dep: f"{dep} · {names[dep]}", key="status_departments")
         if status_departments:
-            st.plotly_chart(status_figure(state["panel"], context, scenario, status_departments), width="stretch")
-            selected_status = state["panel"][(state["panel"].scenario == scenario) & (state["panel"].annee == year)
+            st.plotly_chart(status_figure(state["panel"], context, scenario_drees, status_departments), width="stretch")
+            selected_status = state["panel"][(state["panel"].scenario == scenario_drees) & (state["panel"].annee == year)
                                                & state["panel"].dep.isin(status_departments)].copy()
             selected_status["part_salaries"] *= 100
             selected_status.insert(1, "nom", selected_status.dep.map(names))
@@ -2110,17 +2651,18 @@ def main():
                          "part_salaries": SALARIED_SHARE + " (%)"}), hide_index=True, width="stretch")
         st.caption("Les nouvelles cohortes reçoivent la même répartition par statut que le total de leur département et de leur année. Cette extrapolation ne modélise pas les transitions individuelles entre modes d’exercice.")
     with tab_internat:
+        st.caption(shown_choice)
         calibration = state["vacancy_calibration"]
         st.write("Le coefficient corrige les arrivées futures, en comparant le taux de remplissage extrapolé à un taux constant de référence. Il s’applique à la cohorte d’entrée en internat, puis produit un effet sur les effectifs cinq ans plus tard.")
         st.info("La série inclut le recul récent des postes non pourvus : 86/554 en 2025 (15,52 %), puis 37/653 en 2026 (5,67 %), hors CESP pour ces deux derniers millésimes. L’évolution n’est donc pas une hausse continue.")
-        st.caption(f"Estimation validée : {calibration['debut']}–{calibration['derniere_observation']}. Taux de référence : {100 * calibration['taux_reference']:.2f} %. Correction {'active' if proposed['internat']['active'] else 'désactivée'}. La courbe ci-dessous montre l’extrapolation estimée dans les deux cas.")
+        st.caption(f"Estimation : {calibration['debut']}–{calibration['derniere_observation']}. Taux de référence : {100 * calibration['taux_reference']:.2f} %. Correction {'active' if proposed['internat']['active'] else 'désactivée'}. La courbe ci-dessous montre l’extrapolation estimée dans les deux cas.")
         st.caption(f"Projection linéaire : {100 * calibration['pente_annuelle']:+.3f} point de pourcentage par an, avec raccord au dernier taux observé. Les taux sont limités à l’intervalle 0–100 %.")
         st.plotly_chart(vacancy_figure(state["vacancy_curve"], calibration), width="stretch")
         if state["vacancy_curve"].borne_atteinte.any():
             st.warning("La droite extrapolée sort de l’intervalle 0–100 % à certains horizons. Les taux y sont maintenus à la borne correspondante.")
         st.caption(f"Coefficient de flux = min(1, (1 − taux futur) / (1 − taux de référence)). Si la tendance estimée s’améliore, aucune réduction supplémentaire n’est appliquée. Les cohortes entrées au plus tard en {anchor} conservent un coefficient de 1.")
         flows = state["national_flows"]
-        shown = flows[flows.scenario == scenario]
+        shown = flows[flows.scenario == scenario_drees]
         if shown.plafond_atteint.any():
             st.warning("L’extrapolation retirerait plus de psychiatres que le total de référence dans certaines années. Le retrait est limité à ce total ; ces horizons demandent de revoir les hypothèses.")
         st.dataframe(shown[["annee", "annee_entree_internat", "psychiatrie", "coefficient_entrees", "flux_fr_reference", "flux_fr_corrige", "manque_cumule_metro", "coefficient_stock"]].rename(
@@ -2137,66 +2679,19 @@ def main():
             history_table["Source"] = history_table.source.map(VACANCY_SOURCES)
             st.dataframe(history_table[["annee", "Postes non pourvus (%)", "Source"]].rename(columns={"annee": "Année"}), hide_index=True, width="stretch")
             st.caption("2013–2022 : pourcentages publiés arrondis ; 2023–2026 : rapports calculés à partir des comptes publiés. Les anciennes publications ne précisent pas toutes le traitement des CESP. Cette limite de comparabilité est conservée dans le README.")
-    with tab_mobility:
-        st.write("Pour les politiques publiques, on calcule d’abord les installations historiques de chaque couple lieu de diplôme / région d’exercice : max(0, effectif courant − (1 − retraite) × effectif précédent). Les pourcentages historiques sont ensuite extrapolés linéairement depuis 2026, bornés à 0–100 % et renormalisés pour totaliser 100 %.")
-        st.write("Le volume annuel par lieu de diplôme est estimé séparément : on agrège les effectifs observés des régions françaises, on calcule les installations historiques par la même formule, puis on extrapole leur nombre depuis 2026 avec un plancher à zéro. Le volume est multiplié par les pourcentages pour répartir les nouveaux arrivants.")
-        st.caption("La projection démographique et la tendance étrangère active à curseur nul conservent leurs calculs à partir des stocks. L’option de répartition par stocks ne change que les pourcentages des politiques publiques. Les installations restent reconstituées : les mobilités de carrière peuvent aussi contribuer aux deltas.")
-        available_origins = sorted(state["installation_panel"].origine.unique())
-        origin_labels = {**REGIONS, "01": "Antilles-Guyane", "98": "Région de diplôme inconnue", "99": "Diplôme obtenu à l’étranger"}
-        origin = st.selectbox("Lieu de diplôme à examiner", available_origins,
-                              index=available_origins.index("99"),
-                              format_func=lambda code: f"{code} · {origin_labels.get(code, code)}", key="mobility_origin")
-        inspection_year = st.slider("Année de la répartition projetée", anchor + 1, int(df.annee.max()),
-                                     max(anchor + 1, year), key="mobility_year")
-        panel = state["installation_panel"]
-        inspection = panel[panel.origine == origin].copy()
-        historical = state["installation_history"].query("origine == @origin").copy()
-        detail = inspection[inspection.annee == inspection_year].copy()
-        destination_labels = {**REGIONS, "01": "Guadeloupe", "02": "Martinique", "03": "Guyane", "04": "La Réunion", "06": "Mayotte", "99": "COM ou étranger"}
-        detail["Région d’exercice"] = detail.destination.map(destination_labels).fillna(detail.destination)
-        detail["Part (%)"] = 100 * detail.part
-        origin_flow = state["origin_installations"].query("origine == @origin and annee == @inspection_year").iloc[0]
-        detail["Arrivées de référence réparties"] = origin_flow.installations * detail.part
-        detail["Part reconstituée en 2026 (%)"] = 100 * detail.part_ancrage
-        detail["Pente estimée (points/an)"] = 100 * detail.pente_part
-        columns = ["destination", "Région d’exercice", "Part (%)", "Arrivées de référence réparties", "repli"]
-        if proposed["mobilite"]["methode"] == FLOW_ALLOCATION:
-            columns[2:2] = ["Part reconstituée en 2026 (%)", "Pente estimée (points/an)"]
-        st.dataframe(detail[columns].rename(columns={"destination": "Code", "repli": "Règle de repli"}), hide_index=True, width="stretch")
-        st.caption(f"Volume annuel de référence de cette origine en {inspection_year} : {origin_flow.installations:.2f} installations en France, avant hausse et éventuelle correction des postes vacants. Tendance du volume : {origin_flow.pente_installations:+.3f} installations par an, estimée sur {int(origin_flow.debut_estimation)}–{anchor}.")
-        figure = installation_share_figure(historical, inspection, destination_labels,
-            f"Répartition utilisée par les curseurs — {origin_labels.get(origin, origin)}", anchor)
-        st.plotly_chart(figure, width="stretch")
-        st.caption(f"Trait plein : proportions historiques reconstituées ; tirets : projection. La ligne verticale marque {anchor}. Méthode validée : {proposed['mobilite']['methode']}. Les départements reçoivent ensuite la part de leur région selon leur poids observé en {anchor}.")
-        if (detail.repli != "Aucun").any():
-            st.info("Le flux estimé est nul ou le stock projeté est épuisé pour cette origine : la répartition utilise les effectifs projetés, puis si nécessaire les parts de 2026.")
-        if proposed["mobilite"]["methode"] == FLOW_ALLOCATION and detail.borne_part.any():
-            st.info("Certaines proportions extrapolées atteignent une borne. Elles sont limitées à 0–100 %, puis renormalisées ensemble pour totaliser 100 %.")
-        st.caption("Toutes les origines utilisent le même champ français, DROM inclus. La destination COM ou étranger est exclue des simulations de politiques publiques ; les parts ultramarines ne sont pas réaffectées à la métropole. Le code 98 n’est pas assimilé au code 99.")
-        with st.expander("Installations historiques et volume de l’origine"):
-            history_detail = historical.copy()
-            history_detail["Région d’exercice"] = history_detail.destination.map(destination_labels)
-            st.dataframe(history_detail[["annee", "Région d’exercice", "effectif", "precedent", "installations", "part_installations"]].rename(columns={
-                "annee": "Année", "effectif": "Effectif observé", "precedent": "Effectif observé précédent", "installations": "Installations reconstituées", "part_installations": "Proportion historique issue des installations (0–1)"}), hide_index=True, width="stretch")
-            st.dataframe(state["origin_installation_history"].query("origine == @origin")[["annee", "effectif", "precedent", "installations"]].rename(columns={
-                "annee": "Année", "effectif": "Stock total France", "precedent": "Stock total France précédent", "installations": "Installations nationales reconstituées"}), hide_index=True, width="stretch")
-        st.write(f"Code 99 : la tendance démographique reste calculée sur les stocks projetés, avec un ajustement nul en {anchor} et un cumul de l’écart au flux de {anchor}. Il reste actif à 0 % de hausse. Le curseur migratoire utilise séparément le volume d’installations extrapolé sur l’historique et les proportions choisies ci-dessus, sans délai ni correction des postes vacants français.")
-        st.dataframe(state["foreign_cohorts"].query("scenario == @scenario")[["annee", "effectif", "flux_reference", "flux_ancrage", "ecart_flux", "flux_intervention", "flux_hausse", "flux_ajoute"]].rename(
-            columns={"annee": "Année d’arrivée", "effectif": "Diplômés étrangers exerçant en France", "flux_reference": "Flux démographique issu des stocks", "flux_ancrage": f"Flux de référence {anchor}", "ecart_flux": "Écart démographique annuel au flux de référence", "flux_intervention": "Flux extrapolé pour le curseur", "flux_hausse": "Hausse annuelle du curseur", "flux_ajoute": "Ajustement annuel total France"}), hide_index=True, width="stretch")
-        st.caption("Un écart négatif signifie moins d'arrivées que dans le scénario à flux constant de référence, pas un nombre négatif d'installations. La référence 2026 est une convention de scénario supplémentaire ; le flux étranger exactement intégré dans la DREES n'est pas isolé ici.")
-        if state["foreign_trend_limited_rows"]:
-            st.warning("L’écart cumulé aurait rendu certains effectifs départementaux négatifs. Leur correction a été limitée à un effectif nul ; la décomposition montre le retrait effectivement appliqué.")
     with tab_demand:
         render_demand_tab(demand, demand_error)
     with tab_match:
-        render_match_tab(matching, matching_error, scenario, year, names)
+        st.caption(shown_choice)
+        render_match_tab(matching, matching_error, scenario_drees, year, names)
     with tab_method:
+        st.caption(shown_choice)
         first = proposed["formation"]["rentree"] + proposed["formation"]["delai"]
-        st.write(f"Places en deuxième année : hausse annuelle permanente à partir de {proposed['formation']['rentree']}, avec premiers effets en {first}. Délai validé : {proposed['formation']['delai']} ans. Le défaut de dix ans correspond à cinq ans avant le DES et cinq ans de DES.")
+        st.write(f"Places en deuxième année : hausse annuelle permanente à partir de {proposed['formation']['rentree']}, avec premiers effets en {first}. Délai retenu : {proposed['formation']['delai']} ans. Le défaut de dix ans correspond à cinq ans avant le DES et cinq ans de DES.")
         st.write("Pour chaque lieu de diplôme, le volume de référence des politiques publiques vient des installations historiques nationales, extrapolées directement. Une hausse de places de +u % ajoute u % de ce flux à chaque cohorte après le délai prévu. Le coefficient de postes non pourvus à l’entrée en internat, cinq ans plus tôt, est appliqué une seule fois aux cohortes françaises si la correction est activée.")
         st.write("Chaque cohorte supplémentaire est répartie selon la matrice diplôme → exercice prédite pour son année d’installation, puis selon les parts départementales observées dans chaque région d'exercice. Les destinations hors métropole restent au dénominateur. Les cohortes sont cumulées sans attrition ni retraite supplémentaire jusqu'en 2070 ; les cohortes déjà arrivées ne sont pas redistribuées à chaque nouvelle année.")
         st.caption("Le tableau donne l’effet de +1 % pour la première cohorte supplémentaire ; les cohortes suivantes s’accumulent. Le volume par origine ne dépend pas du scénario DREES ; X, exprimé relativement au total, en dépend. Les stocks d’internes DREES restent utilisés uniquement pour la correction nationale de la trajectoire démographique.")
-        st.dataframe(calibration_table(reference, context, scenario, proposed, state["national_flows"], state["intervention_routing"], state["training_cohorts"]), hide_index=True, width="stretch")
+        st.dataframe(calibration_table(reference, context, scenario_drees, proposed, state["national_flows"], state["intervention_routing"], state["training_cohorts"]), hide_index=True, width="stretch")
         missing = [REGIONS[code] for code in REGIONS if code not in context["available"]]
         if missing:
             st.warning("Calibration de formation absente pour : " + ", ".join(missing) + ". Une ouverture ex nihilo nécessite des hypothèses supplémentaires ; le curseur reste désactivé. Ces régions peuvent recevoir des diplômés formés ailleurs.")
@@ -2204,6 +2699,7 @@ def main():
         st.write(f"Projection avant saturation = total national de référence × part départementale de {anchor} + pente départementale × années depuis {anchor}. Les pentes somment à zéro. L'effet commence dès {anchor + 1}. Le lissage sous 1 psychiatre et la renormalisation préservent des effectifs non négatifs et le total national.")
         if metadata["mode_projection"] == "regional":
             st.write(f"Lorsque les dynamiques sont activées, le total des projections régionales sert de trajectoire nationale : leur ventilation régionale est remplacée par les parts {anchor} et les écarts départementaux. Désactiver les dynamiques rétablit la ventilation régionale de référence.")
+        st.write(f"Installations selon le lieu de diplôme : {proposed['mobilite']['methode']} ; départs à la retraite {proposed['mobilite']['retraite']:.1f} % par an ; estimation à partir de {proposed['mobilite']['debut']}. Le code 99 désigne le lieu du diplôme (étranger), pas la nationalité ; sa tendance démographique reste active à 0 % de hausse.")
         with st.expander("Sources et champ des effectifs"):
             st.write(f"Onglet de projection des actifs : {metadata['onglet_drees']}.")
             if metadata["mode_projection"] == "national":
@@ -2213,6 +2709,57 @@ def main():
             st.write("Les résultats sont des nombres de psychiatres et une part salariée en %. Les observations proviennent directement de l’onglet Effectifs. Les valeurs projetées fractionnaires représentent des effectifs attendus.")
             st.write("Aucun fichier de projections n'est écrit. Le calcul de référence est partagé en mémoire ; les paramètres et résultats simulés appartiennent à chaque session.")
         st.caption("Les formules, limites et règles d'extension sont détaillées dans README.md.")
+
+
+def main():
+    st.set_page_config(page_title="Projections psychiatres", layout="wide")
+    try:
+        require_excel_reader()
+        signature = source_signature()
+        with st.spinner("Lecture et calibration des données…"):
+            reference, metadata, context = load_reference(signature)
+    except FileNotFoundError as exc:
+        st.error(f"Fichier absent : {exc.filename}. Placer les deux classeurs à côté de app.py.")
+        st.stop()
+    except (ValueError, KeyError, OSError, RuntimeError) as exc:
+        st.error(str(exc))
+        st.stop()
+    registry = modulation_registry(context)
+    demand, demand_error = None, None
+    try:
+        demand = demand_outcomes()
+        choices, labels = matching_choices(demand)
+    except (OSError, ValueError, KeyError, ImportError) as exc:
+        demand, demand_error, choices, labels = None, str(exc), None, {}
+    match_defaults = matching_defaults(choices, labels)
+    predefined = predefined_scenarios(registry, context, match_defaults)
+    # Un changement de sources/code réinitialise le scénario et l'éditeur.
+    # Une nouvelle session démarre aussi sur le scénario Base.
+    if st.session_state.get("parameter_source") != signature:
+        for key in [k for k in st.session_state if str(k).startswith(("edit__", "edit_all"))]:
+            del st.session_state[key]
+        st.session_state.scenario_active = deepcopy(predefined["Base"])
+        st.session_state.scenario_previous = None
+        st.session_state.scenario_draft = make_scenario("Mon scénario", "Personnalisé",
+                                                        predefined["Base"]["offre"], match_defaults)
+        st.session_state.parameter_source = signature
+    app = {"reference": reference, "metadata": metadata, "context": context, "registry": registry,
+           "signature": signature, "demand": demand, "demand_error": demand_error, "choices": choices,
+           "labels": labels, "match_defaults": match_defaults, "predefined": predefined,
+           "names": context["baseline"].set_index("dep").nom.to_dict()}
+    pages = {}
+
+    def projections():
+        render_projections_page(app, pages["scenarios"])
+
+    def scenarios():
+        render_scenarios_page(app, pages["projections"])
+
+    pages["projections"] = st.Page(projections, title="Projections", icon=":material/map:", url_path="projections", default=True)
+    pages["scenarios"] = st.Page(scenarios, title="Scénarios", icon=":material/tune:", url_path="scenarios")
+    navigation = st.navigation({"Tableau de bord": [pages["projections"], pages["scenarios"]]})
+    render_sidebar_summary(st.session_state.scenario_active, context, labels)
+    navigation.run()
 
 
 if __name__ == "__main__":
