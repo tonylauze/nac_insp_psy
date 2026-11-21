@@ -2247,10 +2247,11 @@ def render_match_tab(matching, error, scenario, year, names):
 FAMILY_SUPPLY, FAMILY_DEMAND, FAMILY_MATCH = "Offre", "Demande", "Offre / demande"
 DEMAND_MEASURES = {"count": "personnes avec besoin potentiel", "rate": "pour 1 000 habitants"}
 SIDEBAR_WIDTH = 220  # Pixels.
-# La carte occupe la hauteur de la fenêtre moins l'en-tête, les onglets et la ligne
-# de sélecteurs : titre, carte et options restent visibles ensemble, sans défilement.
+# La carte suit la hauteur de la fenêtre : espace libre sous l'en-tête et les onglets,
+# multiplié par MAP_SCALE. Avec 1, titre, carte et sélecteurs tiennent sans défilement.
 MAP_RESERVED_HEIGHT = 305  # Pixels hors carte, mesurés sur la page Projections.
 MAP_MIN_HEIGHT = 340
+MAP_SCALE = 1.2  # Carte 20 % plus haute que l'espace libre : les sélecteurs passent un peu plus bas.
 PAGE_STYLE = f"""<style>
 [data-testid="stMainBlockContainer"] {{padding-top: 2.3rem; padding-bottom: 2rem;}}
 [data-testid="stSidebar"] {{width: {SIDEBAR_WIDTH}px !important; min-width: {SIDEBAR_WIDTH}px !important;
@@ -2263,7 +2264,8 @@ PAGE_STYLE = f"""<style>
 [data-testid="stSidebarNavLink"] p {{font-size: 1.02rem; font-weight: 600;}}
 [data-testid="stSidebarNavLink"][aria-current="page"] {{background: #c53948; border-color: #c53948;}}
 [data-testid="stSidebarNavLink"][aria-current="page"] * {{color: #ffffff !important;}}
-.st-key-map_box {{height: calc(100vh - {MAP_RESERVED_HEIGHT}px) !important; min-height: {MAP_MIN_HEIGHT}px;
+.st-key-map_box {{height: calc({MAP_SCALE} * (100vh - {MAP_RESERVED_HEIGHT}px)) !important;
+                  min-height: {round(MAP_SCALE * MAP_MIN_HEIGHT)}px;
                   flex: 0 0 auto !important;}}
 </style>"""
 
