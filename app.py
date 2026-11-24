@@ -3,6 +3,10 @@
 Installation : pip install streamlit plotly pandas numpy openpyxl
 Lancement   : streamlit run app.py
 
+Version : France (101 départements), correspondances fixes, périmètre adulte,
+plateau de postes vacants et politiques nationales de prévalence par âge.
+Les politiques sont des hypothèses de scénario, appliquées avant l'agrégation.
+
 Placer les deux classeurs et requirements.txt à côté de ce script. Sur Streamlit
 Cloud, requirements.txt installe notamment openpyxl, nécessaire pour lire Excel.
 
@@ -33,7 +37,9 @@ des effectifs attendus. Les taux nationaux de postes non pourvus sont intégrés
 au code avec leurs sources ; aucun fichier supplémentaire n’est requis.
 
 Extension : ajouter une fonction et une entrée à modulation_registry, dans ce fichier.
-Dynamiques départementales et places de formation : voir README.md pour les formules.
+Les formules utilisées sont décrites dans l'onglet Calibration et hypothèses.
+La demande nécessite demand_projection/run.py, outcomes.py et les CSV de dataDemand/.
+Seuls les classeurs Insee présents sont utilisés ; un scénario démographique suffit.
 """
 from dataclasses import dataclass
 from copy import deepcopy
@@ -77,7 +83,7 @@ DREES_PATH = ROOT / "DREES_projections_medecins_2026.xlsx"
 DEMAND_SUMMARY_PATH = ROOT / "dataDemand" / "output" / "demand_projection_summary.csv"
 TOTAL_POPULATION_PATH = ROOT / "dataDemand" / "output" / "population_totale.csv"
 ACTIVITY_PROJECTION_PATH = ROOT / "dataSupply" / "actes_par_psychiatre.csv"
-GEOJSON_URL = "https://raw.githubusercontent.com/gregoiredavid/france-geojson/master/departements-version-simplifiee.geojson"
+GEOJSON_URL = "https://raw.githubusercontent.com/gregoiredavid/france-geojson/master/departements-avec-outre-mer.geojson"
 COLUMNS = ["dep", "annee", "scenario", "indicateur", "valeur"]
 COUNT = "Effectif de psychiatres"
 SALARIED_SHARE = "Part de salariés"
@@ -121,18 +127,25 @@ VACANCY_OBSERVATIONS = (
     (2025, 86 / 554, "cnup_2025"), (2026, 37 / 653, "cnup_2026"),
 )
 METRO = {f"{n:02d}" for n in range(1, 96) if n != 20} | {"2A", "2B"}
+DROM = {"971": "Guadeloupe", "972": "Martinique", "973": "Guyane", "974": "La Réunion", "976": "Mayotte"}
+DEPARTMENTS = METRO | set(DROM)
 DES_YEARS = 5
 STUDY_YEARS = 5 + DES_YEARS  # Depuis l'entrée en deuxième année ; réglable.
-FLOW_ALLOCATION = "Installations estimées (delta + retraites)"
-STOCK_ALLOCATION = "Répartition des effectifs projetés"
+VACANCY_LINEAR = "Extrapolation linéaire"
+VACANCY_PLATEAU = "Plateau au maximum observé"
 SMOOTH_FLOOR = 1.0  # Psychiatre ; raccord C1 à la fonction identité.
 REGIONS = {
+    "01": "Guadeloupe", "02": "Martinique", "03": "Guyane", "04": "La Réunion", "06": "Mayotte",
     "11": "Île-de-France", "24": "Centre-Val de Loire",
     "27": "Bourgogne-Franche-Comté", "28": "Normandie",
     "32": "Hauts-de-France", "44": "Grand Est", "52": "Pays de la Loire",
     "53": "Bretagne", "75": "Nouvelle-Aquitaine", "76": "Occitanie",
     "84": "Auvergne-Rhône-Alpes", "93": "Provence-Alpes-Côte d’Azur", "94": "Corse",
 }
+# Les lieux de formation ultramarins sont groupés dans les sources DREES/RPPS.
+TRAINING_REGIONS = {code: label for code, label in REGIONS.items() if code not in {"02", "03", "06"}}
+TRAINING_REGIONS.update({"01": "Antilles-Guyane", "04": "La Réunion-Mayotte"})
+
 
 
 def normalize(value):
@@ -304,13 +317,13 @@ def historical_psychiatry(path):
         for row in rows:
             if any(row[pos[k]] != v for k, v in [("tranche_age", "00-Ensemble"), ("sexe", "0-Ensemble")]):
                 continue
-            if normalize(row[pos["territoire"]]) != "francemetropolitaine":
+            if normalize(row[pos["territoire"]]) not in {"francemetropolitaine", "drom"}:
                 continue
             if normalize(row[pos["specialites"]]) != "psychiatrie":
                 continue
             raw_dep = str(row[pos["departement"]]).split("-", 1)[0].strip()
             dep = raw_dep[-2:] if len(raw_dep) == 3 and raw_dep.startswith("0") else raw_dep
-            if dep not in METRO:
+            if dep not in DEPARTMENTS:
                 continue
             label = normalize(row[pos["exercice"]])
             if label not in EXERCISE_GROUPS:
@@ -347,9 +360,45 @@ def historical_psychiatry(path):
                                           out=np.zeros(len(history)), where=history.effectif > 0)
     years = sorted(history.annee.unique())
     if (years != list(range(min(years), max(years) + 1))
-            or set(history.dep) != METRO or len(history) != len(METRO) * len(years)):
+            or set(history.dep) != DEPARTMENTS or len(history) != len(DEPARTMENTS) * len(years)):
         raise ValueError("Historique départemental incomplet.")
     return history, pd.DataFrame(names)
+
+
+def pediatric_shares(path):
+    """Part nationale des qualifications enfant/adolescent, sans double comptage."""
+    require_excel_reader()
+    book = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        rows = book["Effectifs par spécialités"].iter_rows(values_only=True)
+        header = next(rows)
+        p = {value: i for i, value in enumerate(header) if value is not None}
+        selected = [row for row in rows if normalize(row[p["specialites"]]) == "psychiatrie"]
+        total = [row for row in selected if normalize(row[p["specialites_detaillees"]]) == "ensemble"]
+        children = [row for row in selected if "enfant" in normalize(row[p["specialites_detaillees"]])
+                    and "adolescent" in normalize(row[p["specialites_detaillees"]])]
+        if len(total) != 1 or not children:
+            raise ValueError("Qualifications de pédopsychiatrie ou total national absents du RPPS.")
+        records = []
+        for column, index in p.items():
+            if re.fullmatch(r"effectif_\d{4}", str(column)):
+                n, child = float(total[0][index]), sum(float(row[index]) for row in children)
+                if not np.isfinite([n, child]).all() or not 0 <= child < n:
+                    raise ValueError("Part nationale de pédopsychiatrie invalide.")
+                records.append({"annee": int(column[-4:]), "total": n, "pedopsychiatres": child, "part": child / n})
+        return pd.DataFrame(records).sort_values("annee")
+    finally:
+        book.close()
+
+
+def scope_factors(years, context, excluded):
+    if not excluded:
+        return np.ones(len(years))
+    shares = context["pediatric_shares"].set_index("annee").part
+    values = pd.Series(np.minimum(np.asarray(years), context["anchor"])).map(shares)
+    if values.isna().any():
+        raise ValueError("Part nationale de pédopsychiatrie manquante pour certaines années.")
+    return 1 - values.to_numpy()
 
 
 def assemble_reference(history, names, regional):
@@ -482,7 +531,7 @@ def vacancy_history():
     return pd.DataFrame(VACANCY_OBSERVATIONS, columns=["annee", "taux", "source"])
 
 
-def vacancy_projection(start, anchor, end):
+def vacancy_projection(start, anchor, end, method=VACANCY_LINEAR):
     """Tendance linéaire des taux ; raccord au dernier taux réellement publié.
 
     MCO avec constante et poids égaux par année. Seule la pente est prolongée,
@@ -501,6 +550,10 @@ def vacancy_projection(start, anchor, end):
     years = np.arange(int(observed.annee.min()), end + 1)
     curve = pd.DataFrame({"annee": years})
     raw = float(last.taux) + slope * (years - last.annee)
+    if method == VACANCY_PLATEAU:
+        raw = np.where(years > anchor, float(estimation.taux.max()), raw)
+    elif method != VACANCY_LINEAR:
+        raise ValueError("Méthode de projection des postes non pourvus inconnue.")
     curve["taux_projete"] = np.clip(raw, 0.0, 1.0)
     curve["borne_atteinte"] = (years > last.annee) & ((raw < 0.0) | (raw > 1.0))
     curve["taux_observe"] = curve.annee.map(observed.set_index("annee").taux)
@@ -513,13 +566,14 @@ def vacancy_projection(start, anchor, end):
     curve["coefficient"] = np.where(curve.annee > anchor,
                                      np.minimum(1.0, (1 - curve.taux) / (1 - baseline)), 1.0)
     return curve, {"pente_annuelle": slope, "taux_reference": baseline,
-                   "derniere_observation": int(last.annee), "debut": start}
+                   "derniere_observation": int(last.annee), "debut": start,
+                   "methode": method, "plateau": float(estimation.taux.max())}
 
 
 def prepare_national_flows(reference, parameters, context):
     """Calcul commun aux départements ; chaque coefficient porte sur une cohorte."""
     anchor = context["anchor"]
-    curve, calibration = vacancy_projection(parameters["debut"], anchor, int(reference.annee.max()))
+    curve, calibration = vacancy_projection(parameters["debut"], anchor, int(reference.annee.max()), parameters["methode"])
     stocks = context["stocks"].sort_values(["scenario", "annee"])
     flows = stocks[stocks.annee > anchor][["annee", "scenario", "psychiatrie"]].copy()
     flows["annee_entree_internat"] = flows.annee - DES_YEARS
@@ -533,21 +587,14 @@ def prepare_national_flows(reference, parameters, context):
         flows["coefficient_entrees"] = 1.0
     flows["flux_fr_reference"] = flows.psychiatrie / DES_YEARS
     flows["flux_fr_corrige"] = flows.flux_fr_reference * flows.coefficient_entrees
-    # Conversion France -> métropole par la calibration des formations et leur mobilité.
-    retention = context["routing"].groupby(["origine", "annee"], as_index=False).part.sum()
-    weights = context["weights"].merge(retention, on="origine", validate="many_to_many")
-    weights["contribution_metro"] = weights.poids * weights.part
-    shares = weights.groupby(["scenario", "annee"]).contribution_metro.sum()
-    keys = pd.MultiIndex.from_frame(flows[["scenario", "annee"]])
-    flows["part_flux_metropole"] = shares.reindex(keys).to_numpy()
-    if flows.part_flux_metropole.isna().any() or not flows.part_flux_metropole.between(0, 1 + 1e-8).all():
-        raise ValueError("Calibration France/métropole invalide pour les flux d'internes.")
-    flows["manque_annuel_metro"] = (flows.flux_fr_reference - flows.flux_fr_corrige) * flows.part_flux_metropole
-    flows["manque_cumule_metro"] = flows.groupby("scenario").manque_annuel_metro.cumsum()
+    # Le champ est désormais la France : le flux national ne subit plus de retrait DROM.
+    flows["part_flux_france"] = 1.0
+    flows["manque_annuel_france"] = (flows.flux_fr_reference - flows.flux_fr_corrige) * flows.part_flux_france
+    flows["manque_cumule_france"] = flows.groupby("scenario").manque_annuel_france.cumsum()
     totals = reference[reference.projete].groupby(["annee", "scenario"], as_index=False).effectif.sum()
     flows = flows.merge(totals.rename(columns={"effectif": "total_reference"}), on=["annee", "scenario"], validate="one_to_one")
-    flows["retrait_applique"] = np.minimum(flows.manque_cumule_metro, flows.total_reference)
-    flows["plafond_atteint"] = flows.manque_cumule_metro > flows.total_reference
+    flows["retrait_applique"] = np.minimum(flows.manque_cumule_france, flows.total_reference)
+    flows["plafond_atteint"] = flows.manque_cumule_france > flows.total_reference
     flows["coefficient_stock"] = np.divide(flows.total_reference - flows.retrait_applique,
                                            flows.total_reference, out=np.ones(len(flows)), where=flows.total_reference > 0)
     return flows, curve, calibration
@@ -565,7 +612,7 @@ def internat_correction(projected, parameters, context):
 
 
 # ---------- Calibration : étudiants, mobilité, écarts départementaux ----------
-def training_students(path, anchor, names):
+def training_students(path, anchor, names, mobility):
     """Stocks DREES du troisième cycle ; jamais assimilés directement à des flux."""
     require_excel_reader()
     book = openpyxl.load_workbook(path, read_only=True, data_only=True)
@@ -643,6 +690,10 @@ def training_students(path, anchor, names):
         if len(national_total) != 1 or not np.isclose(national_total.iloc[0], total.iloc[0], atol=1, rtol=0):
             raise ValueError("Totaux national et régional des étudiants incompatibles.")
         detail["origine"] = detail.libelle.map(mapping)
+        for label, origin in {"guyanemartiniqueguadeloupe": "01", "lareunionmayotte": "04"}.items():
+            value = float(detail.loc[detail.libelle == label, "stock"].sum())
+            if value:
+                weights.append({"scenario": scenario, "origine": origin, "poids": value / total.iloc[0]})
         for origin, value in detail.dropna(subset=["origine"]).groupby("origine").stock.sum().items():
             weights.append({"scenario": scenario, "origine": origin, "poids": value / total.iloc[0]})
     weights = pd.DataFrame(weights)
@@ -700,169 +751,24 @@ def diploma_history(path, anchor):
 
 
 def project_diploma_distribution(history, parameters, anchor, end):
-    """Stocks linéaires raccordés, puis I(t)=max(0, N(t)-(1-r)N(t-1))."""
-    start = parameters["debut"]
-    retirement = parameters["retraite"] / 100.0
-    selected = history[history.annee.between(start, anchor)].copy()
-    expected_years = list(range(start, anchor + 1))
-    if (len(expected_years) < 5 or sorted(selected.annee.unique()) != expected_years
-            or not selected.groupby(["origine", "destination"]).size().eq(len(expected_years)).all()):
-        raise ValueError("Fenêtre d'estimation diplôme/exercice incomplète.")
-    x = selected.annee - np.mean(expected_years)
-    selected["produit"], selected["carre"] = x * selected.effectif, x * x
-    sums = selected.groupby(["origine", "destination"])[["produit", "carre"]].sum()
-    slopes = (sums.produit / sums.carre).rename("pente")
-    base = history[history.annee == anchor].set_index(["origine", "destination"]).effectif.rename("ancrage")
-    previous = history[history.annee == anchor - 1].set_index(["origine", "destination"]).effectif
-    models = pd.concat([base, slopes], axis=1).reset_index()
-    panel = models.merge(pd.DataFrame({"annee": range(anchor, end + 1)}), how="cross")
-    panel["effectif"] = np.maximum(0.0, panel.ancrage + panel.pente * (panel.annee - anchor))
-    panel = panel.sort_values(["origine", "destination", "annee"]).reset_index(drop=True)
-    panel["precedent"] = panel.groupby(["origine", "destination"]).effectif.shift()
-    at_anchor = panel.annee == anchor
-    keys = pd.MultiIndex.from_frame(panel.loc[at_anchor, ["origine", "destination"]])
-    panel.loc[at_anchor, "precedent"] = previous.reindex(keys).to_numpy()
-    if panel.precedent.isna().any():
-        raise ValueError("Effectif précédent absent pour le calcul des installations.")
-    panel["installations_brutes"] = panel.effectif - (1 - retirement) * panel.precedent
-    panel["installations"] = panel.installations_brutes.clip(lower=0.0)
-    group = ["origine", "annee"]
-    stock_total = panel.groupby(group).effectif.transform("sum")
-    base_total = panel.groupby(group).ancrage.transform("sum")
-    base_share = np.divide(panel.ancrage.to_numpy(), base_total.to_numpy(), out=np.zeros(len(panel)), where=base_total.to_numpy() > 0)
-    stock_share = np.divide(panel.effectif.to_numpy(), stock_total.to_numpy(), out=base_share.copy(), where=stock_total.to_numpy() > 0)
-    if parameters["methode"] == FLOW_ALLOCATION:
-        flow_total = panel.groupby(group).installations.transform("sum")
-        panel["part"] = np.divide(panel.installations.to_numpy(), flow_total.to_numpy(), out=stock_share.copy(), where=flow_total.to_numpy() > 0)
-        panel["repli"] = np.where(flow_total > 0, "Aucun", np.where(stock_total > 0, "Effectifs projetés", "Répartition à l'ancrage"))
-    else:
-        panel["part"] = stock_share
-        panel["repli"] = np.where(stock_total > 0, "Aucun", "Répartition à l'ancrage")
-    # Les origines intégralement nulles sont indisponibles, pas renormalisées arbitrairement.
-    nonzero = base_total > 0
-    totals = panel[nonzero].groupby(group).part.sum()
-    if not np.allclose(totals, 1.0, atol=1e-10) or not panel.part.between(0, 1).all():
-        raise ValueError("Répartition d'installations invalide.")
+    """Matrice diplôme -> exercice fixe ; tendance des stocks nationaux par origine."""
+    selected = history[history.annee.between(parameters["debut"], anchor)]
+    base = history[history.annee == anchor][["origine", "destination", "effectif"]].rename(columns={"effectif": "ancrage"})
+    totals = base.groupby("origine").ancrage.transform("sum")
+    base["part"] = np.divide(base.ancrage, totals, out=np.zeros(len(base)), where=totals > 0)
+    national = selected.groupby(["origine", "annee"], as_index=False).effectif.sum()
+    slopes = {}
+    for origin, group in national.groupby("origine"):
+        if len(group) < 5:
+            raise ValueError("Au moins cinq années pour estimer les stocks par lieu de diplôme.")
+        slopes[origin] = float(np.polyfit(group.annee - anchor, group.effectif, 1)[0])
+    base["stock_origine"] = totals
+    base["pente_origine"] = base.origine.map(slopes)
+    panel = base.merge(pd.DataFrame({"annee": range(anchor, end + 1)}), how="cross")
+    panel["effectif"] = np.maximum(0, panel.stock_origine + panel.pente_origine * (panel.annee - anchor)) * panel.part
     panel["projete"] = panel.annee > anchor
+    panel["repli"] = "Correspondance observée fixe"
     return panel
-
-
-def installation_history(history, retirement):
-    """Reconstituer les flux sur les stocks OBSERVÉS avant toute régression."""
-    result = history.sort_values(["origine", "destination", "annee"]).copy()
-    if result.duplicated(["origine", "destination", "annee"]).any():
-        raise ValueError("Historique d'installations dupliqué.")
-    grouped = result.groupby(["origine", "destination"])
-    result["precedent"] = grouped.effectif.shift()
-    previous_year = grouped.annee.shift()
-    valid = result.precedent.notna()
-    if not (result.loc[valid, "annee"] - previous_year[valid]).eq(1).all():
-        raise ValueError("Année manquante dans l'historique d'installations.")
-    result = result.loc[valid].copy()
-    result["installations_brutes"] = result.effectif - (1 - retirement) * result.precedent
-    result["installations"] = result.installations_brutes.clip(lower=0.0)
-    return result
-
-
-def extrapolate_installations(observed, start, anchor, end):
-    """MCO sur les flux historiques, puis pente raccordée au flux reconstitué en b."""
-    start = max(start, int(observed.annee.min()))
-    selected = observed[observed.annee.between(start, anchor)].copy()
-    years = list(range(start, anchor + 1))
-    keys = ["origine", "destination"]
-    if (len(years) < 5 or sorted(selected.annee.unique()) != years
-            or not selected.groupby(keys).size().eq(len(years)).all()):
-        raise ValueError("Au moins cinq années complètes d'installations sont nécessaires.")
-    x = selected.annee - np.mean(years)
-    selected["produit"], selected["carre"] = x * selected.installations, x * x
-    sums = selected.groupby(keys)[["produit", "carre"]].sum()
-    slopes = (sums.produit / sums.carre).rename("pente_installations")
-    base = observed[observed.annee == anchor].set_index(keys).installations.rename("installations_ancrage")
-    models = pd.concat([base, slopes], axis=1).reset_index()
-    if models[["installations_ancrage", "pente_installations"]].isna().any().any():
-        raise ValueError("Modèle d'installations incomplet à l'ancrage.")
-    result = models.merge(pd.DataFrame({"annee": range(anchor, end + 1)}), how="cross")
-    result["installations_brutes"] = result.installations_ancrage + result.pente_installations * (result.annee - anchor)
-    result["installations"] = result.installations_brutes.clip(lower=0.0)
-    result["debut_estimation"] = start
-    result["projete"] = result.annee > anchor
-    return result
-
-
-def installation_distribution(panel, method):
-    """Parts pour les curseurs, avec repli sur les stocks si tous les flux sont nuls."""
-    result = panel.copy()
-    groups = ["origine", "annee"]
-    totals = result.groupby(groups)
-    stock_total = totals.effectif.transform("sum").to_numpy()
-    base_total = totals.ancrage.transform("sum").to_numpy()
-    base_share = np.divide(result.ancrage.to_numpy(), base_total, out=np.zeros(len(result)), where=base_total > 0)
-    stock_share = np.divide(result.effectif.to_numpy(), stock_total, out=base_share.copy(), where=stock_total > 0)
-    if method == FLOW_ALLOCATION:
-        flow_total = totals.installations.transform("sum").to_numpy()
-        result["part"] = np.divide(result.installations.to_numpy(), flow_total, out=stock_share.copy(), where=flow_total > 0)
-        result["repli"] = np.where(flow_total > 0, "Aucun", np.where(stock_total > 0, "Effectifs projetés", "Répartition à l'ancrage"))
-    else:
-        result["part"] = stock_share
-        result["repli"] = np.where(stock_total > 0, "Aucun", "Répartition à l'ancrage")
-    nonzero = base_total > 0
-    if (not np.allclose(result[nonzero].groupby(groups).part.sum(), 1.0, atol=1e-10)
-            or not result.part.between(0, 1).all()):
-        raise ValueError("Répartition des cohortes supplémentaires invalide.")
-    return result
-
-
-def project_installation_distribution(history, parameters, stock_panel, anchor, end):
-    """I historiques -> proportions historiques -> extrapolation bornée des proportions."""
-    france = history[history.destination != "99"]
-    observed = installation_history(france, parameters["retraite"] / 100.0)
-    projected = stock_panel[stock_panel.destination != "99"].drop(
-        columns=["installations", "installations_brutes", "part", "repli"]).copy()
-    base = projected[projected.annee == anchor][["origine", "destination", "ancrage"]]
-    observed = observed.merge(base, on=["origine", "destination"], validate="many_to_one")
-    observed["projete"] = False
-    observed = installation_distribution(observed, FLOW_ALLOCATION)
-    observed["part_installations"] = observed.part
-    start = max(parameters["debut"], int(observed.annee.min()))
-    selected = observed[observed.annee.between(start, anchor)].copy()
-    years = list(range(start, anchor + 1))
-    keys = ["origine", "destination"]
-    if (len(years) < 5 or sorted(selected.annee.unique()) != years
-            or not selected.groupby(keys).size().eq(len(years)).all()):
-        raise ValueError("Fenêtre des proportions d'installations incomplète.")
-    x = selected.annee - np.mean(years)
-    selected["produit"], selected["carre"] = x * selected.part, x * x
-    sums = selected.groupby(keys)[["produit", "carre"]].sum()
-    slopes = (sums.produit / sums.carre).rename("pente_part")
-    initial = observed[observed.annee == anchor].set_index(keys).part.rename("part_ancrage")
-    models = pd.concat([initial, slopes], axis=1).reset_index()
-    projected = projected.merge(models, on=keys, validate="many_to_one")
-    projected["part_brute"] = projected.part_ancrage + projected.pente_part * (projected.annee - anchor)
-    projected["part_bornee"] = projected.part_brute.clip(0.0, 1.0)
-    projected["borne_part"] = (projected.part_brute < 0) | (projected.part_brute > 1)
-    projected["debut_estimation"] = start
-    fallback = installation_distribution(projected, STOCK_ALLOCATION)
-    if parameters["methode"] == FLOW_ALLOCATION:
-        total = projected.groupby(["origine", "annee"]).part_bornee.transform("sum").to_numpy()
-        projected["part"] = np.divide(projected.part_bornee.to_numpy(), total,
-                                      out=fallback.part.to_numpy().copy(), where=total > 0)
-        projected["repli"] = np.where(total > 0, "Aucun", np.where(fallback.repli == "Aucun", "Effectifs projetés", fallback.repli))
-    else:
-        projected["part"], projected["repli"] = fallback.part, fallback.repli
-        observed = installation_distribution(observed, STOCK_ALLOCATION)
-    if not projected.part.between(0, 1).all():
-        raise ValueError("Proportion d'installation hors de 0–100 %.")
-    return projected, observed
-
-
-def origin_installation_flows(history, parameters, anchor, end):
-    """Volumes des deux curseurs : stocks observés agrégés par origine -> I -> projection."""
-    france = history[history.destination != "99"]
-    national = france.groupby(["origine", "annee"], as_index=False).effectif.sum()
-    national["destination"] = "France"
-    observed = installation_history(national, parameters["retraite"] / 100.0)
-    projected = extrapolate_installations(observed, parameters["debut"], anchor, end)
-    return projected, observed
 
 
 def annual_routing(panel, baseline):
@@ -886,71 +792,47 @@ def accumulate_arrivals(reference, cohorts, routing):
     return result
 
 
-def foreign_reference_flows(panel, retirement, anchor):
-    """Flux national de diplômés étrangers, puis écart annuel au flux observé en b.
-
-    Le max est appliqué APRÈS agrégation. La destination 99 (COM ou étranger)
-    n'est pas une région d'exercice française identifiable et reste exclue.
-    Les écarts au flux de référence peuvent être signés, jamais les flux eux-mêmes.
-    """
+def foreign_reference_flows(panel, anchor):
+    """Variation nette du stock étranger projeté, sans hypothèse de retraite."""
     foreign = panel[(panel.origine == "99") & (panel.destination != "99")]
-    totals = foreign.groupby("annee", as_index=False)[["effectif", "precedent"]].sum()
-    totals["flux_reference"] = (totals.effectif - (1 - retirement) * totals.precedent).clip(lower=0.0)
-    baseline = totals.loc[totals.annee == anchor, "flux_reference"]
-    if len(baseline) != 1:
-        raise ValueError("Flux étranger de l'année de référence absent ou ambigu.")
-    totals["flux_ancrage"] = float(baseline.iloc[0])
-    totals["ecart_flux"] = np.where(totals.annee > anchor, totals.flux_reference - totals.flux_ancrage, 0.0)
+    totals = foreign.groupby("annee", as_index=False).effectif.sum().sort_values("annee")
+    totals["ecart_flux"] = totals.effectif.diff().fillna(0.0)
+    totals["flux_reference"] = totals.ecart_flux.clip(lower=0.0)
     totals["origine"] = "99"
     return totals
 
 
 def foreign_france_distribution(panel):
-    """Répartition conditionnelle à une installation en France, DROM inclus.
-
-    Le flux calculé porte sur la France : les parts sont renormalisées sur ce
-    même champ avant de retenir les départements métropolitains de l'application.
-    """
+    """Correspondance fixe, conditionnelle à un exercice en France, DROM inclus."""
     france = panel[(panel.origine == "99") & (panel.destination != "99")].copy()
-    total = france.groupby("annee").part.transform("sum").to_numpy()
-    current = france.groupby("annee").effectif.transform("sum").to_numpy()
-    initial = france.groupby("annee").ancrage.transform("sum").to_numpy()
-    initial_parts = np.divide(france.ancrage.to_numpy(), initial, out=np.zeros(len(france)), where=initial > 0)
-    fallback = np.divide(france.effectif.to_numpy(), current, out=initial_parts.copy(), where=current > 0)
-    france["part"] = np.divide(france.part.to_numpy(), total, out=fallback.copy(), where=total > 0)
-    if not np.allclose(france.groupby("annee").part.sum(), 1.0):
-        raise ValueError("Aucune répartition française disponible pour l'origine 99.")
+    total = france.groupby("annee").part.transform("sum")
+    if (total <= 0).any():
+        raise ValueError("Aucune correspondance française pour les diplômés à l'étranger.")
+    france["part"] /= total
     return france
 
 
 def prepare_arrivals(reference, parameters, context):
     flows = context["national_flows"]
-    origin_flows, historical_origins = origin_installation_flows(context["mobility_history"],
-        parameters["mobilite"], context["anchor"], int(reference.annee.max()))
-    training = origin_flows[origin_flows.origine.isin(context["available"])].rename(columns={"installations": "flux_reference"})
-    training = training.merge(flows[["annee", "scenario", "coefficient_entrees"]], on="annee", validate="many_to_many")
+    training = flows[["annee", "scenario", "flux_fr_reference", "coefficient_entrees"]].merge(
+        context["weights"], on="scenario", validate="many_to_many")
+    training["flux_reference"] = training.flux_fr_reference * training.poids
     training["flux_corrige"] = training.flux_reference * training.coefficient_entrees
     first = parameters["formation"]["rentree"] + parameters["formation"]["delai"]
     increases = training.origine.map(lambda code: parameters["formation"].get(f"region_{code}", 0) / 100.0)
     training["flux_ajoute"] = np.where(training.annee >= first, training.flux_corrige * increases, 0.0)
     panel = context["mobility_panel"]
-    foreign = foreign_reference_flows(panel, parameters["mobilite"]["retraite"] / 100.0, context["anchor"])
-    intervention = origin_flows[origin_flows.origine == "99"]
-    foreign = foreign.merge(intervention[["annee", "installations", "pente_installations"]].rename(
-        columns={"installations": "flux_intervention", "pente_installations": "pente_flux_intervention"}),
-        on="annee", validate="one_to_one")
+    foreign = foreign_reference_flows(panel, context["anchor"])
     foreign = foreign.merge(pd.DataFrame({"scenario": sorted(reference.scenario.unique())}), how="cross")
     foreign["flux_hausse"] = np.where(foreign.annee >= parameters["immigration"]["debut"],
-        foreign.flux_intervention * parameters["immigration"]["hausse"] / 100.0, 0.0)
+        foreign.flux_reference * parameters["immigration"]["hausse"] / 100.0, 0.0)
     foreign["flux_ajoute"] = foreign.ecart_flux + foreign.flux_hausse
     routing = annual_routing(foreign_france_distribution(panel), context["baseline"])
-    intervention_routing = annual_routing(foreign_france_distribution(context["installation_panel"]), context["baseline"])
     return {"training_cohorts": training, "foreign_cohorts": foreign,
-            "training_arrivals": accumulate_arrivals(reference, training, context["intervention_routing"]),
-            "foreign_routing": routing, "foreign_intervention_routing": intervention_routing,
-            "origin_installations": origin_flows, "origin_installation_history": historical_origins,
+            "training_arrivals": accumulate_arrivals(reference, training, context["routing"]),
+            "foreign_routing": routing, "foreign_intervention_routing": routing,
             "foreign_trend_arrivals": accumulate_arrivals(reference, foreign.assign(flux_ajoute=foreign.ecart_flux), routing),
-            "foreign_arrivals": accumulate_arrivals(reference, foreign.assign(flux_ajoute=foreign.flux_hausse), intervention_routing)}
+            "foreign_arrivals": accumulate_arrivals(reference, foreign.assign(flux_ajoute=foreign.flux_hausse), routing)}
 
 
 def count_reference(frame, baseline, count_column="effectif"):
@@ -990,7 +872,7 @@ def build_context(history, names, stocks, weights, mobility):
     trends = estimate_department_trends(history, baseline, int(history.annee.min()), anchor)
     baseline = baseline.merge(trends, on="dep", validate="one_to_one")
     origin_totals = mobility[mobility.annee == anchor].groupby("origine").effectif.sum()
-    available = set(origin_totals[origin_totals > 0].index) & set(REGIONS)
+    available = set(origin_totals[origin_totals > 0].index) & set(REGIONS) & set(weights.loc[weights.poids > 0, "origine"])
     return {"anchor": anchor, "baseline": baseline, "stocks": stocks,
             "history": history.copy(deep=True),
             "status_models": fit_status_models(history, anchor),
@@ -1085,19 +967,16 @@ def modulation_registry(context):
                 disabled=code not in context["available"],
                 help="Hausse annuelle permanente des places, à spécialisation et mobilité constantes."
                 if code in context["available"] else "Pas d'effectif de référence disponible pour ce lieu de diplôme ; curseur désactivé.")
-        for code, label in sorted(REGIONS.items(), key=lambda item: item[1])
+        for code, label in sorted(TRAINING_REGIONS.items(), key=lambda item: item[1])
     )
     return (
-        Modulation("mobilite", "Installations selon le lieu de diplôme",
-                   "La trajectoire démographique conserve les extrapolations de stocks. Pour les politiques publiques, les proportions et les volumes sont estimés séparément à partir des installations historiques, puis extrapolés.",
-                   (Control("methode", "Répartition des nouveaux arrivants pour les politiques publiques", "select", FLOW_ALLOCATION,
-                            options=(FLOW_ALLOCATION, STOCK_ALLOCATION),
-                            help="Ce choix modifie uniquement les proportions des cohortes supplémentaires. Il ne change ni leurs volumes par lieu de diplôme, ni la trajectoire démographique sans hausse."),
-                    Control("retraite", "Taux annuel uniforme de départ à la retraite (%)", "number", 3.0, 0.0, 20.0, 0.1,
-                            help="Hypothèse réglable, non estimée : installations = max(0, effectif courant − (1 − taux) × effectif précédent)."),
-                    Control("debut", "Première année pour les dynamiques diplôme/exercice", "number",
-                            context["mobility_start"], context["mobility_start"], context["anchor"] - 4, 1,
-                            help="Effectifs à partir de cette année. Pour les installations, première année disponible : 2013, calculée avec 2012. Une fenêtre débutant plus tard utilise aussi le compte précédent pour son premier delta.")), calibration_only),
+        Modulation("perimetre", "Périmètre de soins",
+                   "Le retrait des pédopsychiatres applique la même part nationale à chaque département et statut. La demande des moins de 18 ans est également exclue.",
+                   (Control("exclure_pedopsychiatres", "Exclure les pédopsychiatres et la demande des moins de 18 ans", "checkbox", False),), calibration_only),
+        Modulation("mobilite", "Correspondance diplôme → exercice",
+                   f"Parts régionales fixes observées en {context['anchor']}, puis parts départementales fixes. Les nouveaux diplômés français sont calibrés par les stocks d'internes DREES divisés par cinq. Aucun taux de retraite n'intervient.",
+                   (Control("debut", "Première année pour la tendance des effectifs diplômés à l'étranger", "number",
+                            context["mobility_start"], context["mobility_start"], context["anchor"] - 4, 1),), calibration_only),
         Modulation("dynamique", "Dynamiques départementales",
                    f"Tendances des effectifs (psychiatres par an), estimées jusqu'à {context['anchor']}. Effet dès {context['anchor'] + 1}, indépendant du délai de formation.",
                    (Control("active", "Extrapoler les dynamiques départementales", "checkbox", True),
@@ -1105,8 +984,10 @@ def modulation_registry(context):
                             context["observed_start"], context["anchor"] - 4, 1,
                             help="Tout l'historique par défaut. Choisir 2017 pour dix années, ou 2022 pour cinq années avec les sources 2026. Une fenêtre courte peut modifier fortement la pente.")), department_dynamics),
         Modulation("internat", "Dynamique nationale de l'internat",
-                   "Correction uniforme des futures cohortes par une tendance linéaire du taux de postes non pourvus. L'amélioration de 2026 est incluse.",
+                   "Correction des futures cohortes : tendance linéaire ou plateau immédiat au maximum observé sur la période sélectionnée, dès la première année projetée.",
                    (Control("active", "Appliquer la correction des postes non pourvus", "checkbox", True),
+                    Control("methode", "Projection des postes non pourvus", "select", VACANCY_LINEAR,
+                            options=(VACANCY_LINEAR, VACANCY_PLATEAU)),
                     Control("debut", "Première année pour la tendance des postes non pourvus", "number",
                             min(v[0] for v in VACANCY_OBSERVATIONS), min(v[0] for v in VACANCY_OBSERVATIONS),
                             max(v[0] for v in VACANCY_OBSERVATIONS) - 4, 1,
@@ -1114,12 +995,12 @@ def modulation_registry(context):
                    internat_correction),
         Modulation("etranger_tendance", "Tendance nationale des arrivées étrangères", "", (), foreign_trend_adjustment),
         Modulation("immigration", "Diplômés à l'étranger — code 99",
-                   "La tendance démographique issue des effectifs reste active à 0 %. Le curseur ajoute un pourcentage du flux national reconstitué sur l'historique puis extrapolé directement, sans délai de formation. Le code 99 désigne le lieu du diplôme.",
-                   (Control("hausse", "Hausse des arrivées de diplômés à l'étranger (%)", "slider", 0, 0, 100, 1),
+                   "La tendance du stock national reste active à 0 %. Le curseur majore son accroissement net positif annuel, réparti avec la correspondance observée. Ce flux net ne mesure pas les entrées brutes. Le code 99 désigne le lieu du diplôme.",
+                   (Control("hausse", "Majoration de l'accroissement net des diplômés à l'étranger (%)", "slider", 0, 0, 100, 1),
                     Control("debut", "Première année de hausse des arrivées étrangères", "number", context["anchor"] + 1,
                             context["anchor"] + 1, int(context["stocks"].annee.max()), 1)), immigration_additions),
         Modulation("formation", "Places de formation par région",
-                   "Hausse des places en deuxième année, reconduite pour chaque cohorte. Volume prévu à partir des installations historiques du lieu de diplôme ; répartition selon les pourcentages extrapolés ou les stocks, au choix.",
+                   "Hausse des places en deuxième année, reconduite pour chaque cohorte. Volume : stock national d'internes en psychiatrie / 5 × poids régional de formation DREES. Répartition selon la correspondance diplôme → exercice observée.",
                    (Control("rentree", "Première rentrée augmentée en deuxième année", "number", context["anchor"] + 1,
                             context["anchor"] + 1, int(context["stocks"].annee.max()) - DES_YEARS, 1),
                     Control("delai", "Délai deuxième année → installation (années)", "number", STUDY_YEARS,
@@ -1159,15 +1040,11 @@ def apply_modulations(reference, parameters, context, return_contributions=False
     registry = modulation_registry(context)
     validate_parameters(parameters, registry)
     run_context = deepcopy(context)
-    demographic_parameters = {**parameters["mobilite"], "methode": FLOW_ALLOCATION}
-    mobility_panel = project_diploma_distribution(context["mobility_history"], demographic_parameters,
+    mobility_panel = project_diploma_distribution(context["mobility_history"], parameters["mobilite"],
                                                   context["anchor"], int(reference.annee.max()))
     run_context["mobility_panel"] = mobility_panel
     run_context["routing"] = annual_routing(mobility_panel, context["baseline"])
-    installation_panel, historical_installations = project_installation_distribution(
-        context["mobility_history"], parameters["mobilite"], mobility_panel, context["anchor"], int(reference.annee.max()))
-    run_context["installation_panel"] = installation_panel
-    run_context["intervention_routing"] = annual_routing(installation_panel, context["baseline"])
+    run_context["intervention_routing"] = run_context["routing"]
     flows, curve, calibration = prepare_national_flows(reference, parameters["internat"], run_context)
     run_context["national_flows"] = flows
     arrival_details = prepare_arrivals(reference, parameters, run_context)
@@ -1195,14 +1072,16 @@ def apply_modulations(reference, parameters, context, return_contributions=False
     result.loc[result.effectif == 0, "part_salaries"] = 0.0
     if not np.allclose(result.salaries + result.liberaux, result.effectif, atol=1e-8, rtol=1e-12):
         raise ValueError("Les comptes par statut ne reconstituent pas le total.")
+    factors = scope_factors(result.annee, context, parameters["perimetre"]["exclure_pedopsychiatres"])
+    result[["effectif", "salaries", "liberaux"]] = result[["effectif", "salaries", "liberaux"]].mul(factors, axis=0)
+    contributions = contributions.mul(factors, axis=0)
     if return_details:
         keys = pd.MultiIndex.from_frame(projected[["dep", "annee", "scenario"]])
-        requested = run_context["foreign_trend_arrivals"].set_index(["dep", "annee", "scenario"]).cumul.reindex(keys).to_numpy()
+        requested = run_context["foreign_trend_arrivals"].set_index(["dep", "annee", "scenario"]).cumul.reindex(keys).to_numpy() * factors[projected.index]
         limited = int((~np.isclose(contributions.loc[projected.index, "etranger_tendance"], requested, atol=1e-8, rtol=1e-10)).sum())
         return result, contributions, {"national_flows": flows, "vacancy_curve": curve,
             "vacancy_calibration": calibration, "mobility_panel": mobility_panel,
-            "routing": run_context["routing"], "installation_panel": installation_panel,
-            "installation_history": historical_installations, "intervention_routing": run_context["intervention_routing"],
+            "routing": run_context["routing"], "intervention_routing": run_context["intervention_routing"],
             "foreign_trend_limited_rows": limited, **arrival_details}
     return (result, contributions) if return_contributions else result
 
@@ -1251,9 +1130,10 @@ def load_reference(signature):
         regional = national_to_regions(history, names, national)
         mode = "national"
     reference, anchor = assemble_reference(history, names, regional)
-    stocks, weights = training_students(DREES_PATH, anchor, names)
     mobility = diploma_history(RPPS_PATH, anchor)
+    stocks, weights = training_students(DREES_PATH, anchor, names, mobility)
     context = build_context(history, names, stocks, weights, mobility)
+    context["pediatric_shares"] = pediatric_shares(RPPS_PATH)
     expected = pd.MultiIndex.from_frame(reference[["annee", "scenario"]].drop_duplicates())
     future = expected[expected.get_level_values("annee") >= anchor]
     actual = pd.MultiIndex.from_frame(stocks[["annee", "scenario"]])
@@ -1285,6 +1165,155 @@ def ensure_projections(signature, parameters, reference, metadata, context):
     return output, metadata, True
 
 
+# ---------- Politiques nationales : règles explicites par trouble et tranche d'âge ----------
+POLICY_COLUMNS = ["id", "nom", "active", "indicateur", "age_min", "age_max", "baisse_pct", "debut", "fin", "montee"]
+POLICY_INDICATORS = {
+    "tous": "Tous les troubles couverts",
+    "episode_depressif_12_mois": "Dépression (18–79 ans)",
+    "trouble_anxieux_generalise_12_mois": "Anxiété généralisée (18–79 ans)",
+    "trouble_mental_probable_6_11": "Trouble probable chez l'enfant (6–11 ans)",
+}
+POLICY_COVERAGE = {"episode_depressif_12_mois": (18, 79),
+                   "trouble_anxieux_generalise_12_mois": (18, 79),
+                   "trouble_mental_probable_6_11": (6, 11)}
+
+
+def policy_templates(anchor=2026):
+    """Hypothèses illustratives, sans efficacité empirique revendiquée."""
+    def rule(identifier, name, indicator, lo, hi, reduction):
+        return {"id": identifier, "nom": name, "active": True, "indicateur": indicator,
+                "age_min": lo, "age_max": hi, "baisse_pct": float(reduction),
+                "debut": anchor + 1, "fin": 2070, "montee": 1}
+    return [rule("scolaire", "Prévention de l'anxiété à l'école — illustration", "trouble_anxieux_generalise_12_mois", 6, 17, 15),
+            rule("jeunes", "Prévention de la dépression des jeunes adultes — illustration", "episode_depressif_12_mois", 18, 25, 10),
+            rule("enfance", "Prévention des troubles de l'enfant — illustration", "trouble_mental_probable_6_11", 6, 11, 10)]
+
+
+def validate_policies(policies):
+    if not isinstance(policies, list) or len(policies) > 100:
+        raise ValueError("Les politiques doivent être une liste d'au plus 100 règles.")
+    ids = set()
+    for policy in policies:
+        if not isinstance(policy, dict) or set(policy) != set(POLICY_COLUMNS):
+            raise ValueError("Format de politique invalide ; utiliser le modèle exporté.")
+        if not isinstance(policy["id"], str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", policy["id"]) or policy["id"] in ids:
+            raise ValueError("Chaque règle doit avoir un identifiant unique (lettres, chiffres, - ou _).")
+        ids.add(policy["id"])
+        if not isinstance(policy["nom"], str) or not policy["nom"].strip() or len(policy["nom"]) > 160:
+            raise ValueError("Le nom d'une politique doit contenir de 1 à 160 caractères.")
+        if not isinstance(policy["active"], bool) or policy["indicateur"] not in POLICY_INDICATORS:
+            raise ValueError("Activation ou trouble ciblé invalide.")
+        for key, low, high in [("age_min", 0, 120), ("age_max", 0, 120),
+                               ("debut", 2026, 2070), ("fin", 2026, 2070), ("montee", 1, 45)]:
+            value = policy[key]
+            if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                raise ValueError(f"Valeur entière hors limites pour {key} : {value!r}.")
+        reduction = policy["baisse_pct"]
+        if isinstance(reduction, bool) or not isinstance(reduction, (int, float)) or not np.isfinite(reduction) or not 0 <= reduction <= 100:
+            raise ValueError("La baisse de prévalence doit être comprise entre 0 et 100 %.")
+        if policy["age_min"] > policy["age_max"] or policy["debut"] > policy["fin"]:
+            raise ValueError("L'âge ou l'année de début doit précéder la fin.")
+    # Une même politique ne peut appliquer deux fois son effet à la même cellule.
+    for index, a in enumerate(policies):
+        for b in policies[index + 1:]:
+            if (a["active"] and b["active"] and a["nom"].strip().casefold() == b["nom"].strip().casefold()
+                    and (a["indicateur"] == b["indicateur"] or "tous" in {a["indicateur"], b["indicateur"]})
+                    and max(a["age_min"], b["age_min"]) <= min(a["age_max"], b["age_max"])
+                    and max(a["debut"], b["debut"]) <= min(a["fin"], b["fin"])):
+                raise ValueError(f"Deux règles de « {a['nom']} » se recouvrent : séparer les âges ou les années.")
+
+
+def policy_warnings(policies, exclude_children=False):
+    messages = []
+    for p in policies:
+        if not p["active"]:
+            continue
+        codes = list(POLICY_COVERAGE) if p["indicateur"] == "tous" else [p["indicateur"]]
+        covered = set()
+        for code in codes:
+            lo, hi = POLICY_COVERAGE[code]
+            lo = max(lo, 18) if exclude_children else lo
+            covered.update(range(max(lo, p["age_min"]), min(hi, p["age_max"]) + 1))
+        requested = set(range(p["age_min"], p["age_max"] + 1))
+        if not covered:
+            messages.append(f"{p['nom']} : aucun effet calculable dans le périmètre actuel ; aucun taux de prévalence n'est disponible pour ce trouble à ces âges.")
+        elif requested - covered:
+            messages.append(f"{p['nom']} : effet limité aux âges couverts ({min(covered)}–{max(covered)} ans) ; les autres âges n'ont pas de prévalence dans ce modèle.")
+    return messages
+
+
+def policies_csv(policies):
+    return pd.DataFrame(policies, columns=POLICY_COLUMNS).to_csv(index=False, sep=";").encode("utf-8-sig")
+
+
+def parse_policies_csv(data):
+    if len(data) > 1_000_000:
+        raise ValueError("Fichier de politiques trop volumineux (maximum 1 Mo).")
+    table = pd.read_csv(BytesIO(data), sep=None, engine="python", dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    if set(table.columns) != set(POLICY_COLUMNS):
+        raise ValueError("Colonnes de politiques incorrectes ; télécharger le modèle CSV.")
+    result = []
+    for row in table.to_dict("records"):
+        active = row["active"].strip().lower()
+        if active not in TRUE_WORDS | FALSE_WORDS:
+            raise ValueError("La colonne active doit valoir true/false ou oui/non.")
+        row["active"] = active in TRUE_WORDS
+        for key in ["age_min", "age_max", "debut", "fin", "montee"]:
+            row[key] = parse_number(row[key], True)
+        row["baisse_pct"] = parse_number(row["baisse_pct"], False)
+        result.append(row)
+    validate_policies(result)
+    return result
+
+
+def policy_factor(years, policies):
+    factor = np.ones(len(years))
+    values = np.asarray(years)
+    for p in policies:
+        progress = np.clip((values - p["debut"] + 1) / p["montee"], 0, 1)
+        progress = np.where(values <= p["fin"], progress, 0)
+        factor *= 1 - (p["baisse_pct"] / 100) * progress
+    return factor
+
+
+def project_policy_demand(population, years, scenario, parameters, scenarios, modifiers, policies, exclude_children):
+    """Découper aux frontières d'âge des politiques avant d'agréger les effectifs."""
+    from demand_projection.run import project_workbook, summarize_projection
+    validate_policies(policies)
+    records = []
+    for _, parameter in parameters.iterrows():
+        lo, hi = int(parameter.age_min), int(parameter.age_max)
+        if exclude_children:
+            lo = max(lo, 18)
+        if lo > hi:
+            continue
+        applicable = [p for p in policies if p["active"] and p["indicateur"] in ("tous", parameter.indicator)
+                      and p["age_min"] <= hi and p["age_max"] >= lo]
+        cuts = sorted({lo, hi + 1} | {max(lo, p["age_min"]) for p in applicable}
+                      | {min(hi + 1, p["age_max"] + 1) for p in applicable})
+        for left, right in zip(cuts, cuts[1:]):
+            row = parameter.copy()
+            row["age_min"], row["age_max"] = left, right - 1
+            part = project_workbook(population, years, scenario, pd.DataFrame([row]), scenarios, modifiers, 2026)
+            rules = [p for p in applicable if p["age_min"] <= left and p["age_max"] >= right - 1]
+            part["persons_without_policy"] = part.persons_with_need
+            part["persons_with_need"] *= policy_factor(part.year, rules)
+            part["prevalence"] = part.persons_with_need / part.population_at_risk.replace(0, np.nan)
+            part["prevalence"] = part.prevalence.fillna(0)
+            # Rétablir le périmètre de l'indicateur avant l'agrégation entre segments.
+            part["age_min"], part["age_max"] = lo, hi
+            records.append(part)
+    if not records:
+        raise ValueError("Aucun besoin couvert dans le périmètre sélectionné.")
+    detail = pd.concat(records, ignore_index=True)
+    summary = summarize_projection(detail)
+    keys = ["department", "year", "demographic_scenario", "need_scenario", "indicator", "age_min", "age_max"]
+    before = detail.groupby(keys, as_index=False).persons_without_policy.sum()
+    summary = summary.merge(before, on=keys, validate="one_to_one")
+    summary["prevalence"] = summary.prevalence.fillna(0)
+    return summary
+
+
 # ---------- Scénarios : définition, prédéfinis, export et import ----------
 # Un scénario regroupe tous les paramètres structurels et de politiques publiques :
 #   {"nom", "origine", "offre": paramètres des modulations, "rapprochement": paramètres offre/demande}
@@ -1304,8 +1333,9 @@ MATCH_CONTROLS = (
     ("part_offre", "Part des actes mobilisable pour ce besoin (%)", 0.0, 100.0, 5.0, "50 % est une hypothèse de scénario pour réserver une part de l'activité aux troubles et âges hors référentiel. Ce paramètre évite d'affecter implicitement toute l'offre à un seul besoin."),
 )
 # Regroupement des modulations sur la page Scénarios.
-SCENARIO_GROUPS = (("Paramètres structurels", ("dynamique", "internat", "mobilite")),
+SCENARIO_GROUPS = (("Paramètres structurels", ("perimetre", "dynamique", "internat", "mobilite")),
                    ("Politiques publiques", ("formation", "immigration")),
+                   ("Politiques de demande", ("politiques",)),
                    ("Offre / demande", (MATCH_BLOCK,)))
 SCENARIO_COLUMNS = ["scenario", "bloc", "parametre", "libelle", "valeur"]
 MODE_PREDEFINED, MODE_CREATE, MODE_IMPORT = "Scénarios prédéfinis", "Créer un scénario", "Importer un scénario"
@@ -1337,16 +1367,16 @@ def matching_defaults(choices, labels):
     return values
 
 
-def make_scenario(name, origin, offre, rapprochement, description=""):
+def make_scenario(name, origin, offre, rapprochement, description="", politiques=None):
     return {"nom": name, "origine": origin, "description": description,
-            "offre": deepcopy(offre), "rapprochement": dict(rapprochement)}
+            "offre": deepcopy(offre), "rapprochement": dict(rapprochement), "politiques": deepcopy(politiques or [])}
 
 
 def predefined_scenarios(registry, context, match_values):
     """Scénarios illustratifs : seuls les paramètres cités diffèrent du scénario Base."""
     base = default_parameters(registry)
     first = context["anchor"] + 1
-    places = {f"region_{code}": 20 for code in REGIONS if code in context["available"]}
+    places = {f"region_{code}": 20 for code in TRAINING_REGIONS if code in context["available"]}
 
     def variant(name, description, **changes):
         offre = deepcopy(base)
@@ -1368,7 +1398,12 @@ def predefined_scenarios(registry, context, match_values):
                 "Aucune dégradation future du remplissage de l'internat : toutes les cohortes conservent "
                 f"le taux observé en {context['anchor']}.", internat={"active": False}),
     )
-    return {scenario["nom"]: scenario for scenario in scenarios}
+    result = {scenario["nom"]: scenario for scenario in scenarios}
+    prevention = make_scenario("Prévention nationale — illustration", "Prédéfini", base, match_values,
+        "Hypothèses : −10 % de dépression chez les 18–25 ans et −10 % de troubles probables chez les 6–11 ans dès 2027. Effets illustratifs, non estimés.",
+        politiques=policy_templates(context["anchor"])[1:])
+    result[prevention["nom"]] = prevention
+    return result
 
 
 def complete_matching(scenario, defaults):
@@ -1382,8 +1417,11 @@ def complete_matching(scenario, defaults):
 
 def check_scenario(scenario, registry, choices):
     validate_parameters(scenario["offre"], registry)
+    validate_policies(scenario.get("politiques", []))
     match = scenario["rapprochement"]
     validate_match_parameters(match)
+    if scenario["offre"]["perimetre"]["exclure_pedopsychiatres"] and match.get("need_indicator") == "trouble_mental_probable_6_11":
+        raise ValueError("Le besoin enfant ne peut pas être sélectionné lorsque les pédopsychiatres sont exclus ; choisir un besoin adulte.")
     if choices is not None:
         for key, label in MATCH_CHOICES:
             if match.get(key) not in choices[key]:
@@ -1403,6 +1441,8 @@ def scenario_rows(scenario, registry):
         rows.append({"bloc": MATCH_BLOCK, "parametre": key, "libelle": f"{MATCH_BLOCK_LABEL} — {label}", "valeur": match.get(key)})
     for key, label, *_ in MATCH_CONTROLS:
         rows.append({"bloc": MATCH_BLOCK, "parametre": key, "libelle": f"{MATCH_BLOCK_LABEL} — {label}", "valeur": match[key]})
+    rows.append({"bloc": "demande", "parametre": "politiques_json", "libelle": "Politiques nationales de demande",
+                 "valeur": json.dumps(scenario.get("politiques", []), ensure_ascii=False, sort_keys=True)})
     return rows
 
 
@@ -1445,6 +1485,9 @@ def scenario_differences(scenario, reference, registry, labels=None):
     changed, regions = [], []
     for row, base in zip(scenario_rows(scenario, registry), scenario_rows(reference, registry)):
         if row["valeur"] == base["valeur"]:
+            continue
+        if row["bloc"] == "demande":
+            changed.append(f"Politiques nationales : {sum(p['active'] for p in scenario.get('politiques', []))} règle(s) active(s)")
             continue
         if row["bloc"] == "formation" and row["parametre"].startswith("region_"):
             regions.append(row)
@@ -1509,7 +1552,10 @@ def parse_scenario_file(data, registry, reference, choices):
     controls = {(m.key, c.key): c for m in registry for c in m.controls}
     choice_keys = {key for key, _ in MATCH_CHOICES}
     number_keys = {key: (label, low, high) for key, label, low, high, *_ in MATCH_CONTROLS}
-    known = set(controls) | {(MATCH_BLOCK, key) for key in choice_keys | set(number_keys)}
+    known = set(controls) | {(MATCH_BLOCK, key) for key in choice_keys | set(number_keys)} | {("demande", "politiques_json")}
+    obsolete = (table.bloc == "mobilite") & table.parametre.isin(["methode", "retraite"])
+    migrated = bool(obsolete.any())
+    table = table[~obsolete].copy()
     unknown = [f"{b}/{p}" for b, p in zip(table.bloc, table.parametre) if (b, p) not in known]
     if unknown:
         raise ValueError("Paramètres inconnus : " + ", ".join(unknown[:8]) + ".")
@@ -1518,7 +1564,10 @@ def parse_scenario_file(data, registry, reference, choices):
                              reference["offre"], reference["rapprochement"])
     for row in table.itertuples(index=False):
         try:
-            if (row.bloc, row.parametre) in controls:
+            if (row.bloc, row.parametre) == ("demande", "politiques_json"):
+                scenario["politiques"] = json.loads(row.valeur)
+                validate_policies(scenario["politiques"])
+            elif (row.bloc, row.parametre) in controls:
                 scenario["offre"][row.bloc][row.parametre] = convert_control(controls[(row.bloc, row.parametre)], row.valeur)
             elif row.parametre in choice_keys:
                 scenario["rapprochement"][row.parametre] = row.valeur
@@ -1527,7 +1576,7 @@ def parse_scenario_file(data, registry, reference, choices):
         except (ValueError, TypeError):
             raise ValueError(f"Valeur invalide pour {row.bloc}/{row.parametre} : {row.valeur!r}.") from None
     absent = sorted(known - set(zip(table.bloc, table.parametre)))
-    warnings = []
+    warnings = ["Ancien scénario : méthode delta + retraites supprimée ; correspondance diplôme → exercice fixe utilisée."] if migrated else []
     if absent:
         warnings.append(f"{len(absent)} paramètre(s) absent(s) du fichier : valeurs du scénario Base conservées ("
                         + ", ".join(f"{b}/{p}" for b, p in absent[:6]) + ("…" if len(absent) > 6 else "") + ").")
@@ -1542,7 +1591,7 @@ def scenario_highlights(scenario, context, labels):
               f"{offre['dynamique']['debut']}–{anchor}") if offre["dynamique"]["active"] else "Dynamiques départementales : désactivées",
              (f"Correction de l'internat : active, tendance depuis {offre['internat']['debut']}")
              if offre["internat"]["active"] else "Correction de l'internat : désactivée"]
-    places = [offre["formation"][f"region_{code}"] for code in REGIONS if offre["formation"].get(f"region_{code}")]
+    places = [offre["formation"][f"region_{code}"] for code in TRAINING_REGIONS if offre["formation"].get(f"region_{code}")]
     if places:
         size = f"+{places[0]} %" if len(set(places)) == 1 else f"de +{min(places)} à +{max(places)} %"
         first = offre["formation"]["rentree"] + offre["formation"]["delai"]
@@ -1553,7 +1602,9 @@ def scenario_highlights(scenario, context, labels):
     hausse = offre["immigration"]["hausse"]
     lines.append(f"Diplômés à l'étranger : +{hausse} % dès {offre['immigration']['debut']}"
                  if hausse else "Diplômés à l'étranger : tendance seule")
-    lines.append(f"Départs à la retraite : {display_value(offre['mobilite']['retraite'])} % par an")
+    lines.append("Périmètre : " + ("adultes, pédopsychiatres retirés" if offre["perimetre"]["exclure_pedopsychiatres"] else "adultes et enfants couverts"))
+    lines.append("Internat : " + offre["internat"]["methode"])
+    lines.append(f"Politiques de demande actives : {sum(p['active'] for p in scenario.get('politiques', []))}")
     match = scenario["rapprochement"]
     if match.get("need_indicator"):
         lines.append(f"Offre / demande : {labels.get(match['need_indicator'], match['need_indicator'])}, Insee "
@@ -1572,7 +1623,9 @@ def widget_key(block, parameter):
 def write_widgets(scenario, registry):
     """Recopier un scénario dans les widgets de l'éditeur (appelé avant leur affichage)."""
     st.session_state.scenario_draft = make_scenario(scenario["nom"], "Personnalisé",
-                                                    scenario["offre"], scenario["rapprochement"])
+                                                    scenario["offre"], scenario["rapprochement"], politiques=scenario.get("politiques", []))
+    for key in [k for k in st.session_state if str(k).startswith("policy__")]:
+        del st.session_state[key]
     st.session_state[widget_key("meta", "nom")] = scenario["nom"]
     for modulation in registry:
         for control in modulation.controls:
@@ -1590,7 +1643,7 @@ def scenario_from_widgets(registry):
     match = {key: value(MATCH_BLOCK, key, draft["rapprochement"].get(key))
              for key in [k for k, _ in MATCH_CHOICES] + [k for k, *_ in MATCH_CONTROLS]}
     name = (value("meta", "nom", draft["nom"]) or "").strip() or "Scénario personnalisé"
-    return make_scenario(name, "Personnalisé", offre, match)
+    return make_scenario(name, "Personnalisé", offre, match, politiques=policies_from_widgets())
 
 
 def seed_widget(key, value):
@@ -1649,6 +1702,97 @@ def render_modulation(modulation, registry):
                 render_control(control, modulation.key)
 
 
+def policies_from_widgets():
+    policies = deepcopy(st.session_state.scenario_draft.get("politiques", []))
+    for p in policies:
+        for field in POLICY_COLUMNS:
+            if field != "id":
+                p[field] = st.session_state.get(f"policy__{p['id']}__{field}", p[field])
+    return policies
+
+
+def add_policy(template, registry):
+    from uuid import uuid4
+    draft = scenario_from_widgets(registry)
+    policy = deepcopy(template)
+    policy["id"] = uuid4().hex[:16]
+    used = {p["nom"] for p in draft["politiques"]}
+    if policy["nom"] in used:
+        policy["nom"] += f" ({len(draft['politiques']) + 1})"
+    draft["politiques"].append(policy)
+    st.session_state.scenario_draft = draft
+
+
+def remove_policy(identifier, registry):
+    draft = scenario_from_widgets(registry)
+    draft["politiques"] = [p for p in draft["politiques"] if p["id"] != identifier]
+    st.session_state.scenario_draft = draft
+
+
+def replace_policies(policies, registry):
+    draft = scenario_from_widgets(registry)
+    draft["politiques"] = deepcopy(policies)
+    st.session_state.scenario_draft = draft
+    for key in [k for k in st.session_state if str(k).startswith("policy__")]:
+        del st.session_state[key]
+
+
+def render_policy_editor(context):
+    registry = modulation_registry(context)
+    st.markdown("**Politiques nationales agissant sur la prévalence**")
+    st.caption("Une règle décrit un trouble, une tranche d'âge et une baisse relative de prévalence identique dans tous les départements. Pour plusieurs tranches, créer plusieurs règles portant le même nom, sans recouvrement. Les exemples sont des hypothèses illustratives, pas des effets évalués.")
+    templates = policy_templates(context["anchor"])
+    custom = {**templates[1], "id": "custom", "nom": "Ma politique nationale", "indicateur": "tous", "age_min": 18, "age_max": 79}
+    options = {"Politique personnalisée": custom, **{p["nom"]: p for p in templates}}
+    col, button = st.columns([4, 1], vertical_alignment="bottom")
+    choice = col.selectbox("Modèle de politique", list(options), key="policy_template")
+    button.button("Ajouter", key="add_policy", on_click=add_policy, args=(options[choice], registry),
+                  disabled=len(st.session_state.scenario_draft.get("politiques", [])) >= 100)
+    for p in st.session_state.scenario_draft.get("politiques", []):
+        with st.expander(p["nom"], expanded=True):
+            for field in POLICY_COLUMNS:
+                if field != "id":
+                    seed_widget(f"policy__{p['id']}__{field}", p[field])
+            key = lambda field: f"policy__{p['id']}__{field}"
+            name, active, delete = st.columns([4, 1, 1], vertical_alignment="bottom")
+            name.text_input("Nom de la politique", key=key("nom"), max_chars=160)
+            active.checkbox("Active", key=key("active"))
+            delete.button("Supprimer", key=f"remove_{p['id']}", on_click=remove_policy, args=(p["id"], registry))
+            target, lo, hi, reduction = st.columns([3, 1, 1, 2])
+            target.selectbox("Trouble ciblé", list(POLICY_INDICATORS), format_func=POLICY_INDICATORS.get, key=key("indicateur"))
+            lo.number_input("Âge minimum", 0, 120, step=1, key=key("age_min"))
+            hi.number_input("Âge maximum inclus", 0, 120, step=1, key=key("age_max"))
+            reduction.number_input("Baisse de prévalence (%)", 0.0, 100.0, step=1.0, key=key("baisse_pct"))
+            start, stop, ramp = st.columns(3)
+            start.number_input("Première année d'effet", 2026, 2070, step=1, key=key("debut"))
+            stop.number_input("Dernière année d'effet", 2026, 2070, step=1, key=key("fin"))
+            ramp.number_input("Montée en charge (années)", 1, 45, step=1, key=key("montee"),
+                              help="1 : effet complet dès la première année. 3 : un tiers, deux tiers, puis effet complet. Après la dernière année, l'effet s'arrête.")
+    policies = policies_from_widgets()
+    excluded = st.session_state.get(widget_key("perimetre", "exclure_pedopsychiatres"), st.session_state.scenario_draft["offre"]["perimetre"]["exclure_pedopsychiatres"])
+    try:
+        validate_policies(policies)
+        for message in policy_warnings(policies, excluded):
+            st.warning(message)
+        invalid = False
+    except ValueError as exc:
+        st.error(str(exc))
+        invalid = True
+    export, model = st.columns(2)
+    export.download_button("Exporter les politiques (.csv)", policies_csv(policies), "politiques_nationales.csv", "text/csv",
+                           key="export_policies", disabled=invalid)
+    model.download_button("Télécharger les trois exemples", policies_csv(templates), "exemples_politiques.csv", "text/csv", key="policy_examples")
+    upload = st.file_uploader("Importer des politiques (.csv)", type="csv", key="policies_upload")
+    if upload is not None:
+        try:
+            imported = parse_policies_csv(upload.getvalue())
+            st.caption(f"{len(imported)} règle(s) valide(s). L'import remplace les politiques du brouillon ; cliquer ensuite sur Appliquer ce scénario.")
+            st.button("Charger ces politiques dans le brouillon", key="import_policies", on_click=replace_policies, args=(imported, registry))
+        except (ValueError, TypeError, pd.errors.ParserError, UnicodeError) as exc:
+            st.error(f"Import impossible : {exc}")
+    st.caption("Les politiques sont également incluses dans l'export CSV du scénario complet. Sans données pour un trouble à un âge donné, aucun effet n'est inventé. Les effets de politiques différentes se multiplient sur les âges communs.")
+
+
 def render_matching_editor(choices, labels, has_activity):
     if choices is None:
         st.info("Les données de demande sont indisponibles : seuls les paramètres d'activité sont enregistrés. "
@@ -1681,7 +1825,10 @@ def render_matching_editor(choices, labels, has_activity):
 def load_geojson():
     with urllib.request.urlopen(GEOJSON_URL, timeout=20) as handle:
         gj = json.load(handle)
-    gj["features"] = [f for f in gj["features"] if f["properties"]["code"] in METRO]
+    gj["features"] = [f for f in gj["features"] if f["properties"]["code"] in DEPARTMENTS]
+    missing = DEPARTMENTS - {f["properties"]["code"] for f in gj["features"]}
+    if missing:
+        raise ValueError("Contours départementaux manquants : " + ", ".join(sorted(missing)))
     # Plotly (d3) attend l'anneau extérieur dans le sens horaire, contrairement à
     # la norme GeoJSON. Sans ce retournement, la projection Lambert remplit le globe.
     def area(ring):
@@ -1755,21 +1902,22 @@ def dynamics_figure(diagnostic, context, departments, full=False, start_year=Non
 def calibration_table(reference, context, scenario, parameters, flows, routing, cohorts):
     first = parameters["formation"]["rentree"] + parameters["formation"]["delai"]
     row = flows[(flows.scenario == scenario) & (flows.annee == first)].iloc[0]
-    national = float(row.total_reference * row.coefficient_stock)
+    scope = scope_factors([first], context, parameters["perimetre"]["exclure_pedopsychiatres"])[0]
+    national = float(row.total_reference * row.coefficient_stock) * scope
     origin_flows = cohorts[(cohorts.scenario == scenario) & (cohorts.annee == first)].set_index("origine")
     retention = routing[routing.annee == first].groupby("origine").part.sum()
     records = []
-    for code, label in REGIONS.items():
+    for code, label in TRAINING_REGIONS.items():
         available = code in context["available"]
         flow = float(origin_flows.loc[code, "flux_corrige"]) if available else 0.0
-        additions = 0.01 * flow * retention.get(code, 0)
+        additions = 0.01 * flow * retention.get(code, 0) * scope
         records.append({"Région de formation": label, "Calibration": "Disponible" if available else "Indisponible",
                         "Hausse validée (%)": parameters["formation"][f"region_{code}"],
-                        "Installations extrapolées France": float(origin_flows.loc[code, "flux_reference"]) if available else np.nan,
-                        "Après correction des postes vacants": flow if available else np.nan,
-                        "Exercice métropolitain (%)": 100 * retention.get(code, 0) if available else np.nan,
-                        f"Psychiatres métro. en plus en {first} pour +1 %": additions if available else np.nan,
-                        f"X (%) du total métro. en {first} pour +1 %": 100 * additions / national if available and national > 0 else np.nan})
+                        "Diplômés estimés France (internes / 5)": float(origin_flows.loc[code, "flux_reference"]) if available else np.nan,
+                        "Après correction et périmètre": flow * scope if available else np.nan,
+                        "Exercice en France (%)": 100 * retention.get(code, 0) if available else np.nan,
+                        f"Psychiatres France en plus en {first} pour +1 %": additions if available else np.nan,
+                        f"X (%) du total France en {first} pour +1 %": 100 * additions / national if available and national > 0 else np.nan})
     return pd.DataFrame(records)
 
 
@@ -1796,7 +1944,7 @@ def vacancy_figure(curve, calibration):
     future = curve[curve.annee >= last]
     figure = go.Figure()
     figure.add_trace(go.Scatter(x=observed.annee, y=100 * observed.taux_observe, mode="lines+markers", name="Observé"))
-    figure.add_trace(go.Scatter(x=future.annee, y=100 * future.taux_projete, mode="lines", name="Extrapolation linéaire", line_dash="dash"))
+    figure.add_trace(go.Scatter(x=future.annee, y=100 * future.taux_projete, mode="lines", name=calibration["methode"], line_dash="dash"))
     figure.add_hline(y=100 * calibration["taux_reference"], line_dash="dot", annotation_text="Taux de référence constant")
     figure.update_layout(height=420, xaxis_title="Année d'entrée en internat", yaxis_title="Postes non pourvus (%)",
                          yaxis_range=[0, 100], hovermode="x unified")
@@ -1851,68 +1999,63 @@ def join_demand_population(demand, population):
     return result
 
 
-@st.cache_data(show_spinner=False, max_entries=2)
-def load_demand_summary(path: str, modified_at_ns: int, signature):
-    """Compléter aussi les exports existants, sans exiger un nouveau CSV."""
-    del modified_at_ns, signature
-    from demand_projection.run import SCENARIO_FILES, read_population_workbook
-    from demand_projection.outcomes import prepare_outcomes
-
-    demand = prepare_outcomes(pd.read_csv(path).drop(columns=["population_total"], errors="ignore"))
-    totals = []
-    for scenario, filename in SCENARIO_FILES.items():
-        population, years = read_population_workbook(ROOT / "dataDemand" / filename)
-        totals.append(insee_total_population(population, years, scenario))
-    return join_demand_population(demand, pd.concat(totals, ignore_index=True))
+def available_population_files():
+    from demand_projection.run import SCENARIO_FILES
+    available = {scenario: ROOT / "dataDemand" / filename for scenario, filename in SCENARIO_FILES.items()
+                 if (ROOT / "dataDemand" / filename).is_file()}
+    if not available:
+        raise FileNotFoundError("Aucun classeur Insee déclaré dans SCENARIO_FILES n'est présent dans dataDemand/.")
+    return available
 
 
-@st.cache_data(show_spinner=False, max_entries=2)
-def compute_demand_summary(signature):
-    """Calcul en mémoire avec les modules d'origine ; adaptation limitée à app.py."""
+@st.cache_data(show_spinner=False, max_entries=8)
+def compute_demand_summary(signature, policies_json="[]", exclude_children=False):
+    """Recalcul depuis les sources, pour les seuls scénarios démographiques présents."""
     del signature
-    from demand_projection.run import (SCENARIO_FILES, read_population_workbook,
-        validate_parameters, read_need_scenarios, read_territorial_modifiers,
-        project_workbook, summarize_projection)
+    from demand_projection.run import (read_population_workbook, validate_parameters as validate_prevalence,
+        read_need_scenarios, read_territorial_modifiers)
     from demand_projection.outcomes import prepare_outcomes
-
     data_dir = ROOT / "dataDemand"
-    parameters = validate_parameters(pd.read_csv(data_dir / "prevalence_parameters.csv"))
+    policies = json.loads(policies_json)
+    validate_policies(policies)
+    parameters = validate_prevalence(pd.read_csv(data_dir / "prevalence_parameters.csv"))
     scenarios = read_need_scenarios(data_dir / "need_scenarios.csv")
     modifiers = read_territorial_modifiers(data_dir / "territorial_modifiers.csv")
-    projections, totals = [], []
-    for scenario, filename in SCENARIO_FILES.items():
-        population, years = read_population_workbook(data_dir / filename)
+    summaries, totals = [], []
+    for scenario, path in available_population_files().items():
+        population, years = read_population_workbook(path)
         totals.append(insee_total_population(population, years, scenario))
-        # Le module d'origine affecte des proratas aux colonnes POP_YYYY.
-        # Préparer des flottants localement évite les erreurs de dtype sous pandas 3.
         columns = [f"POP_{year}" for year in years]
         population = population.astype({column: float for column in columns})
-        projections.append(project_workbook(population, years, scenario, parameters, scenarios, modifiers, 2026))
-    summary = summarize_projection(pd.concat(projections, ignore_index=True))
-    demand = prepare_outcomes(summary.drop(columns=["population_total"], errors="ignore"))
+        summaries.append(project_policy_demand(population, years, scenario, parameters, scenarios, modifiers, policies, exclude_children))
+    summary = pd.concat(summaries, ignore_index=True)
+    demand = prepare_outcomes(summary)
+    # Le cumul adulte garde la même hypothèse de non-recouvrement avant/après politique.
+    keys = ["department", "year", "demographic_scenario", "need_scenario", "indicator"]
+    adult = summary[summary.indicator.isin(["episode_depressif_12_mois", "trouble_anxieux_generalise_12_mois"])]
+    totals_before = adult.groupby(keys[:-1], as_index=False).persons_without_policy.sum()
+    totals_before["indicator"] = "besoin_total_sans_recouvrement"
+    before = pd.concat([summary[keys + ["persons_without_policy"]], totals_before], ignore_index=True)
+    demand = demand.drop(columns=["persons_without_policy"], errors="ignore").merge(before, on=keys, validate="one_to_one")
+    demand["persons_avoided"] = (demand.persons_without_policy - demand.persons_with_need).clip(lower=0)
     return join_demand_population(demand, pd.concat(totals, ignore_index=True))
 
 
-def demand_outcomes():
-    """Use a current local export, otherwise calculate from versioned inputs."""
-    from demand_projection.run import SCENARIO_FILES
-
+def demand_outcomes(policies=None, exclude_children=False):
+    policies = [] if policies is None else policies
+    validate_policies(policies)
     data_dir = ROOT / "dataDemand"
-    inputs = [data_dir / filename for filename in SCENARIO_FILES.values()]
+    inputs = list(available_population_files().values())
     inputs += [data_dir / "prevalence_parameters.csv", data_dir / "need_scenarios.csv",
-               ROOT / "demand_projection" / "run.py", ROOT / "demand_projection" / "outcomes.py"]
+               ROOT / "demand_projection" / "run.py", ROOT / "demand_projection" / "outcomes.py", Path(__file__)]
     modifiers = data_dir / "territorial_modifiers.csv"
     if modifiers.exists():
         inputs.append(modifiers)
     signature = tuple((str(path), path.stat().st_mtime_ns, path.stat().st_size) for path in inputs)
-    if DEMAND_SUMMARY_PATH.exists():
-        modified = DEMAND_SUMMARY_PATH.stat().st_mtime_ns
-        if modified >= max(item[1] for item in signature):
-            return load_demand_summary(str(DEMAND_SUMMARY_PATH), modified, signature)
-    return compute_demand_summary(signature)
+    return compute_demand_summary(signature, json.dumps(policies, sort_keys=True), exclude_children)
 
 
-def render_demand_tab(demand=None, error=None):
+def render_demand_tab(demand=None, error=None, policies=None, exclude_children=False):
     """Display demand outcomes with filters independent of the supply scenario."""
     st.write("Projection démographique-épidémiologique indépendante de la projection des effectifs de psychiatres.")
     if error:
@@ -1925,6 +2068,9 @@ def render_demand_tab(demand=None, error=None):
         except (OSError, ValueError, KeyError, ImportError) as exc:
             st.error(f"Demande de soins indisponible : {exc}")
             return
+    st.caption("Périmètre : adultes uniquement." if exclude_children else "Périmètre : adultes 18–79 ans et enfants 6–11 ans, selon l'indicateur.")
+    if any(p["active"] for p in policies or []):
+        st.caption("Les politiques actives du scénario sont appliquées à chaque département. Les effets simultanés se multiplient sur les âges communs : −10 % puis −15 % donnent −23,5 %. La réduction est un niveau, pas une nouvelle baisse cumulée chaque année.")
     demographic_scenarios = sorted(demand["demographic_scenario"].unique())
     need_scenarios = sorted(demand["need_scenario"].unique())
     indicators = sorted(demand["indicator"].unique())
@@ -1972,6 +2118,11 @@ def render_demand_tab(demand=None, error=None):
     metric_a.metric(f"Personnes avec besoin projeté — France, {first_demand_year}", f"{first_demand_value:,.0f}".replace(",", " "))
     metric_b.metric(f"Personnes avec besoin projeté — France, {last_demand_year}", f"{last_demand_value:,.0f}".replace(",", " "))
     metric_c.metric(f"Évolution {first_demand_year}–{last_demand_year}", f"{demand_change:+.1%}" if first_demand_value else "Non calculable")
+    if "persons_without_policy" in filtered_demand:
+        last = filtered_demand[filtered_demand.year == last_demand_year]
+        st.caption(f"En {last_demand_year}, avant politiques : {last.persons_without_policy.sum():,.0f} personnes ; réduction simulée : {last.persons_avoided.sum():,.0f} personnes.")
+        st.download_button("Exporter la demande annuelle de ce scénario", filtered_demand.to_csv(index=False).encode("utf-8-sig"),
+                           "demande_annuelle.csv", "text/csv", key="export_demand_results")
     if selected_demand.empty:
         st.info("Sélectionnez au moins un département pour afficher les résultats.")
     else:
@@ -2009,7 +2160,7 @@ def match_department_codes(frame, baseline):
     names = {normalize(row.nom): row.dep for row in baseline.itertuples()}
     names.update({normalize(name): code for code, name in {
         "971": "Guadeloupe", "972": "Martinique", "973": "Guyane", "974": "La Réunion", "976": "Mayotte"}.items()})
-    names[normalize("Réunion")] = "974"  # Libellé Omphale, reconnu avant le filtre métropole.
+    names[normalize("Réunion")] = "974"  # Libellé Omphale, reconnu avant le filtre France.
     # Le classeur d'effectifs nomme le département 62 « Nord-Pas-de-Calais ».
     names[normalize("Pas-de-Calais")] = "62"
     def code(value):
@@ -2221,9 +2372,9 @@ def render_match_tab(matching, error, scenario, year, names):
         st.info(f"Le rapprochement couvre {available_years[0]}–{available_years[-1]}. Les mesures ci-dessous portent sur {selected_year}.")
     selected = detail[detail.annee == selected_year].copy()
     a, b, c = st.columns(3)
-    a.metric("Actes disponibles — métropole", f"{selected.actes_disponibles.sum():,.0f}".replace(",", " "))
-    b.metric("Actes nécessaires — métropole", f"{selected.actes_necessaires.sum():,.0f}".replace(",", " "))
-    c.metric("Solde annuel par habitant — métropole", f"{selected.solde_actes.sum() / selected.population_total.sum():+.3f}")
+    a.metric("Actes disponibles — France", f"{selected.actes_disponibles.sum():,.0f}".replace(",", " "))
+    b.metric("Actes nécessaires — France", f"{selected.actes_necessaires.sum():,.0f}".replace(",", " "))
+    c.metric("Solde annuel par habitant — France", f"{selected.solde_actes.sum() / selected.population_total.sum():+.3f}")
     departments = st.multiselect("Départements du rapprochement", sorted(names), default=["75"] if "75" in names else [sorted(names)[0]], format_func=lambda dep: f"{dep} · {names[dep]}", key="match_departments")
     shown = detail[detail.dep.isin(departments)].copy()
     shown["Département"] = shown.dep.map(names)
@@ -2312,7 +2463,7 @@ def edit_scenario(scenario, registry, name=None):
 def scenario_short_lines(scenario):
     """Trois repères courts pour la barre latérale ; le détail est sur les pages."""
     offre = scenario["offre"]
-    places = [offre["formation"][f"region_{code}"] for code in REGIONS if offre["formation"].get(f"region_{code}")]
+    places = [offre["formation"][f"region_{code}"] for code in TRAINING_REGIONS if offre["formation"].get(f"region_{code}")]
     first = offre["formation"]["rentree"] + offre["formation"]["delai"]
     size = (f"+{places[0]} %" if len(set(places)) == 1 else f"+{min(places)} à +{max(places)} %") if places else ""
     hausse = offre["immigration"]["hausse"]
@@ -2403,8 +2554,13 @@ def render_creation(app):
     for tab, (_, blocks) in zip(st.tabs([label for label, _ in SCENARIO_GROUPS]), SCENARIO_GROUPS):
         with tab:
             for block in blocks:
-                if block == MATCH_BLOCK:
-                    render_matching_editor(choices, labels, optional_match_inputs()[1] is not None)
+                if block == "politiques":
+                    render_policy_editor(app["context"])
+                elif block == MATCH_BLOCK:
+                    effective_choices = deepcopy(choices)
+                    if effective_choices is not None and st.session_state.get(widget_key("perimetre", "exclure_pedopsychiatres"), False):
+                        effective_choices["need_indicator"] = [i for i in effective_choices["need_indicator"] if i != "trouble_mental_probable_6_11"]
+                    render_matching_editor(effective_choices, labels, optional_match_inputs()[1] is not None)
                 elif by_key[block].controls:
                     render_modulation(by_key[block], registry)
     draft = scenario_from_widgets(registry)
@@ -2460,7 +2616,7 @@ def render_import(app):
 
 
 def demand_map_frame(demand, baseline, match):
-    """Demande du scénario actif, rapprochée des codes départementaux métropolitains."""
+    """Demande du scénario actif, rapprochée des codes départementaux français."""
     selected = demand[(demand.demographic_scenario == match["demographic_scenario"])
                       & (demand.need_scenario == match["need_scenario"])].copy()
     names = pd.DataFrame({"department": selected.department.unique()})
@@ -2548,14 +2704,8 @@ def render_map_tab(app, df, demand, demand_error, matching, matching_error, scen
     return drees, year
 
 
-def render_choropleth(selected, scale_values, value_label, indicator):
-    try:
-        gj = load_geojson()
-    except (OSError, ValueError) as exc:
-        st.warning(f"Carte indisponible ; les tableaux et les courbes restent accessibles : {exc}")
-        return
-    if selected.empty:
-        return
+def france_figure(selected, scale_values, value_label, indicator, gj):
+    """Métropole et cinq encarts DROM, même échelle de couleur partout."""
     is_share, is_balance = indicator == SALARIED_SHARE, indicator == ACTS_BALANCE
     if is_balance:
         bound = max(float(scale_values.abs().quantile(0.98)), 0.001) if not scale_values.empty else 1.0
@@ -2564,24 +2714,48 @@ def render_choropleth(selected, scale_values, value_label, indicator):
         vmin, vmax = (0.0, 100.0) if is_share else scale_values.quantile([0.02, 0.98]) if not scale_values.empty else (0.0, 1.0)
     if vmin == vmax:
         vmax = vmin + 1
-    # Le premier bleu, presque blanc, se confondait avec le fond.
-    fig = px.choropleth(selected, geojson=gj, locations="dep", featureidkey="properties.code", color="valeur",
-                        color_continuous_scale="RdBu" if is_balance else px.colors.sequential.Blues[1:], range_color=(vmin, vmax),
-                        hover_name="nom", custom_data=["dep"], labels={"valeur": value_label})
     unit = " %" if is_share else ""
     number_format = "%{z:+.3f} acte/habitant/an" if is_balance else "%{z:,.1f}" + unit
-    fig.update_traces(marker_line_color="white", marker_line_width=0.6,
-                      hovertemplate="<b>%{hovertext}</b> (%{customdata[0]})<br>" + number_format + "<extra></extra>")
-    # Projection conique conforme de Lambert, comme le Lambert 93 officiel :
-    # la France garde ses proportions, au lieu d'être étirée en largeur.
-    fig.update_geos(projection=dict(type="conic conformal", parallels=[44, 49], rotation=dict(lon=3)),
-                    center=dict(lon=2.3, lat=46.3), lonaxis_range=[-5.3, 9.8], lataxis_range=[41.2, 51.2],
-                    visible=False, bgcolor="rgba(0,0,0,0)")
-    fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), dragmode=False,
-                      paper_bgcolor="rgba(0,0,0,0)", separators=", ",
-                      coloraxis_colorbar=dict(title=dict(text=value_label, side="right"),
-                                              thickness=14, len=0.7, outlinewidth=0))
+    fig = go.Figure()
+    panels = [("Métropole", METRO, [0.20, 0.88], [0, 1])]
+    for index, (dep, label) in enumerate(DROM.items()):
+        top = 1 - index * 0.20
+        panels.append((label, {dep}, [0.0, 0.18], [top - 0.17, top - 0.025]))
+    layout = {}
+    for index, (label, codes, xdomain, ydomain) in enumerate(panels):
+        geo = "geo" if index == 0 else f"geo{index + 1}"
+        subset = selected[selected.dep.isin(codes)]
+        contours = {"type": "FeatureCollection", "features": [f for f in gj["features"] if f["properties"]["code"] in codes]}
+        fig.add_trace(go.Choropleth(geo=geo, geojson=contours, locations=subset.dep, z=subset.valeur,
+            featureidkey="properties.code", coloraxis="coloraxis", text=subset.nom,
+            customdata=subset[["dep"]].to_numpy(), marker_line_color="white", marker_line_width=0.5,
+            hovertemplate="<b>%{text}</b> (%{customdata[0]})<br>" + number_format + "<extra></extra>"))
+        layout[geo] = dict(domain=dict(x=xdomain, y=ydomain), visible=False, bgcolor="rgba(0,0,0,0)",
+                           projection=dict(type="mercator"), fitbounds="locations")
+        if index == 0:
+            layout[geo].update(projection=dict(type="conic conformal", parallels=[44, 49], rotation=dict(lon=3)),
+                center=dict(lon=2.3, lat=46.3), lonaxis_range=[-5.3, 9.8], lataxis_range=[41.2, 51.2], fitbounds=False)
+        else:
+            fig.add_annotation(x=sum(xdomain)/2, y=ydomain[1]+0.02, xref="paper", yref="paper", text=label,
+                               showarrow=False, font=dict(size=11), xanchor="center", yanchor="middle")
+    fig.update_layout(**layout, margin=dict(l=0, r=0, t=10, b=0), dragmode=False,
+        paper_bgcolor="rgba(0,0,0,0)", separators=", ",
+        coloraxis=dict(cmin=float(vmin), cmax=float(vmax), colorscale="RdBu" if is_balance else px.colors.sequential.Blues[1:],
+                       colorbar=dict(title=dict(text=value_label, side="right"), thickness=14, len=0.7, outlinewidth=0)))
+    return fig
+
+
+def render_choropleth(selected, scale_values, value_label, indicator):
+    try:
+        gj = load_geojson()
+    except (OSError, ValueError) as exc:
+        st.warning(f"Carte indisponible ; les tableaux et les courbes restent accessibles : {exc}")
+        return
+    if selected.empty:
+        return
+    fig = france_figure(selected, scale_values, value_label, indicator, gj)
     st.plotly_chart(fig, width="stretch", height="stretch")
+    st.caption("France : 101 départements, France et cinq DROM. Encarts ultramarins à des échelles géographiques différentes ; couleurs comparables. Les collectivités d'outre-mer hors départements ne figurent pas dans ces données.")
 
 
 def render_projections_page(app, scenarios_page):
@@ -2607,6 +2781,12 @@ def render_projections_page(app, scenarios_page):
         st.toast(f"Projections recalculées : {scenario['nom']}.")
     anchor = context["anchor"]
     state = st.session_state.psy_projection
+    if proposed["perimetre"]["exclure_pedopsychiatres"]:
+        context = deepcopy(context)
+        for name in ("history", "baseline"):
+            frame = context[name]
+            factors = scope_factors(frame.annee, context, True)
+            frame[["effectif", "salaries", "liberaux"]] = frame[["effectif", "salaries", "liberaux"]].mul(factors, axis=0)
     mode_text = (f"croissance nationale DREES raccordée aux effectifs RPPS de {anchor} (psychiatrie absente des projections régionales)"
                  if metadata["mode_projection"] == "national" else "projections régionales détaillées de psychiatrie")
     with detail.popover(f"Scénario : {scenario['nom']}", icon=":material/info:", width="stretch",
@@ -2616,6 +2796,21 @@ def render_projections_page(app, scenarios_page):
         st.caption(f"Observé : {df.annee.min()}–{anchor}. Projeté : {anchor + 1}–{df.annee.max()}. Référence : {mode_text}.")
     change.page_link(scenarios_page, label="Changer de scénario", icon=":material/tune:")
     demand, demand_error = app["demand"], app["demand_error"]
+    excluded = proposed["perimetre"]["exclure_pedopsychiatres"]
+    if excluded or scenario.get("politiques"):
+        try:
+            with st.spinner("Application des politiques nationales et du périmètre de soins…"):
+                demand = demand_outcomes(scenario.get("politiques", []), excluded)
+            demand_error = None
+        except (OSError, ValueError, KeyError, ImportError) as exc:
+            demand, demand_error = None, str(exc)
+    local_choices, local_labels = matching_choices(demand)
+    app = {**app, "demand": demand, "choices": local_choices, "labels": local_labels}
+    if excluded:
+        share = context["pediatric_shares"].set_index("annee").loc[anchor]
+        st.caption(f"Périmètre adulte : retrait uniforme de {100 * share.part:.2f} % de l'offre projetée ({share.pedopsychiatres:,.0f} / {share.total:,.0f} en {anchor}). Demande des moins de 18 ans exclue. Dans l'historique, le taux national de chaque année est utilisé.")
+    for message in policy_warnings(scenario.get("politiques", []), excluded):
+        st.warning(message)
     matching, matching_error = None, None
     try:
         if demand is not None:
@@ -2646,7 +2841,7 @@ def render_projections_page(app, scenarios_page):
         if departments:
             diagnostic = dynamics_diagnostic(state["panel"], state["contributions"], context, scenario_drees)
             st.plotly_chart(dynamics_figure(diagnostic, context, departments, True, start, show_fit), width="stretch")
-            if any(proposed["formation"][f"region_{code}"] for code in REGIONS):
+            if any(proposed["formation"][f"region_{code}"] for code in TRAINING_REGIONS):
                 st.caption(f"Ouvertures de places du scénario : premiers effets en {proposed['formation']['rentree'] + proposed['formation']['delai']}. Ce délai concerne les places de formation ; la hausse des arrivées étrangères intervient sans délai.")
             else:
                 st.caption("Aucune hausse de places dans ce scénario.")
@@ -2693,7 +2888,10 @@ def render_projections_page(app, scenarios_page):
         st.write("Le coefficient corrige les arrivées futures, en comparant le taux de remplissage extrapolé à un taux constant de référence. Il s’applique à la cohorte d’entrée en internat, puis produit un effet sur les effectifs cinq ans plus tard.")
         st.info("La série inclut le recul récent des postes non pourvus : 86/554 en 2025 (15,52 %), puis 37/653 en 2026 (5,67 %), hors CESP pour ces deux derniers millésimes. L’évolution n’est donc pas une hausse continue.")
         st.caption(f"Estimation : {calibration['debut']}–{calibration['derniere_observation']}. Taux de référence : {100 * calibration['taux_reference']:.2f} %. Correction {'active' if proposed['internat']['active'] else 'désactivée'}. La courbe ci-dessous montre l’extrapolation estimée dans les deux cas.")
-        st.caption(f"Projection linéaire : {100 * calibration['pente_annuelle']:+.3f} point de pourcentage par an, avec raccord au dernier taux observé. Les taux sont limités à l’intervalle 0–100 %.")
+        if calibration["methode"] == VACANCY_PLATEAU:
+            st.caption(f"Plateau immédiat dès {anchor + 1} : {100 * calibration['plateau']:.2f} %, maximum observé sur {calibration['debut']}–{anchor}. Les années observées sont conservées.")
+        else:
+            st.caption(f"Projection linéaire : {100 * calibration['pente_annuelle']:+.3f} point par an, raccordée au dernier taux observé, bornée entre 0 et 100 %.")
         st.plotly_chart(vacancy_figure(state["vacancy_curve"], calibration), width="stretch")
         if state["vacancy_curve"].borne_atteinte.any():
             st.warning("La droite extrapolée sort de l’intervalle 0–100 % à certains horizons. Les taux y sont maintenus à la borne correspondante.")
@@ -2702,13 +2900,13 @@ def render_projections_page(app, scenarios_page):
         shown = flows[flows.scenario == scenario_drees]
         if shown.plafond_atteint.any():
             st.warning("L’extrapolation retirerait plus de psychiatres que le total de référence dans certaines années. Le retrait est limité à ce total ; ces horizons demandent de revoir les hypothèses.")
-        st.dataframe(shown[["annee", "annee_entree_internat", "psychiatrie", "coefficient_entrees", "flux_fr_reference", "flux_fr_corrige", "manque_cumule_metro", "coefficient_stock"]].rename(
+        st.dataframe(shown[["annee", "annee_entree_internat", "psychiatrie", "coefficient_entrees", "flux_fr_reference", "flux_fr_corrige", "manque_cumule_france", "coefficient_stock"]].rename(
             columns={"annee": "Année d’arrivée", "annee_entree_internat": "Cohorte d’internat",
                      "psychiatrie": "Stock d’étudiants DREES", "coefficient_entrees": "Coefficient du flux",
                      "flux_fr_reference": "Flux France avant correction", "flux_fr_corrige": "Flux France corrigé",
-                     "manque_cumule_metro": "Déficit cumulé métropole", "coefficient_stock": "Facteur uniforme des effectifs"}),
+                     "manque_cumule_france": "Déficit cumulé France", "coefficient_stock": "Facteur uniforme des effectifs"}),
                      hide_index=True, width="stretch")
-        st.write("Le stock d’étudiants est divisé par cinq pour approcher un flux annuel. Le déficit des futures cohortes est cumulé sans sorties ultérieures, puis retiré du total métropolitain selon la calibration formation/mobilité. Le même facteur annuel s’applique à chaque département. Les places supplémentaires utilisent le flux corrigé une seule fois.")
+        st.write("Le stock d’étudiants est divisé par cinq pour approcher un flux annuel. Le déficit des futures cohortes est cumulé sans sorties ultérieures, puis retiré du total français selon la calibration formation/mobilité. Le même facteur annuel s’applique à chaque département. Les places supplémentaires utilisent le flux corrigé une seule fois.")
         st.warning("Scénario additionnel : la documentation publique ne fournit pas le taux exact de non-remplissage déjà inclus dans ProMédI. Le taux de référence constant est une convention, pas un paramètre DREES identifié. La division du stock par cinq et l’absence de sorties des cohortes manquantes restent des approximations.")
         with st.expander("Série historique et sources des postes non pourvus"):
             history_table = vacancy_history()
@@ -2717,7 +2915,7 @@ def render_projections_page(app, scenarios_page):
             st.dataframe(history_table[["annee", "Postes non pourvus (%)", "Source"]].rename(columns={"annee": "Année"}), hide_index=True, width="stretch")
             st.caption("2013–2022 : pourcentages publiés arrondis ; 2023–2026 : rapports calculés à partir des comptes publiés. Les anciennes publications ne précisent pas toutes le traitement des CESP. Cette limite de comparabilité est conservée dans le README.")
     with tab_demand:
-        render_demand_tab(demand, demand_error)
+        render_demand_tab(demand, demand_error, scenario.get("politiques", []), excluded)
     with tab_match:
         st.caption(shown_choice)
         render_match_tab(matching, matching_error, scenario_drees, year, names)
@@ -2725,18 +2923,19 @@ def render_projections_page(app, scenarios_page):
         st.caption(shown_choice)
         first = proposed["formation"]["rentree"] + proposed["formation"]["delai"]
         st.write(f"Places en deuxième année : hausse annuelle permanente à partir de {proposed['formation']['rentree']}, avec premiers effets en {first}. Délai retenu : {proposed['formation']['delai']} ans. Le défaut de dix ans correspond à cinq ans avant le DES et cinq ans de DES.")
-        st.write("Pour chaque lieu de diplôme, le volume de référence des politiques publiques vient des installations historiques nationales, extrapolées directement. Une hausse de places de +u % ajoute u % de ce flux à chaque cohorte après le délai prévu. Le coefficient de postes non pourvus à l’entrée en internat, cinq ans plus tôt, est appliqué une seule fois aux cohortes françaises si la correction est activée.")
-        st.write("Chaque cohorte supplémentaire est répartie selon la matrice diplôme → exercice prédite pour son année d’installation, puis selon les parts départementales observées dans chaque région d'exercice. Les destinations hors métropole restent au dénominateur. Les cohortes sont cumulées sans attrition ni retraite supplémentaire jusqu'en 2070 ; les cohortes déjà arrivées ne sont pas redistribuées à chaque nouvelle année.")
-        st.caption("Le tableau donne l’effet de +1 % pour la première cohorte supplémentaire ; les cohortes suivantes s’accumulent. Le volume par origine ne dépend pas du scénario DREES ; X, exprimé relativement au total, en dépend. Les stocks d’internes DREES restent utilisés uniquement pour la correction nationale de la trajectoire démographique.")
+        st.write("Pour chaque lieu de diplôme français, le volume annuel est approché par le stock national d'internes DREES en psychiatrie divisé par cinq, pondéré par la répartition régionale des étudiants à l'ancrage. La part de psychiatrie dans les étudiants est supposée identique entre régions. Une hausse de places de +u % ajoute u % de ce flux à chaque cohorte après le délai prévu. Le coefficient de postes non pourvus à l’entrée en internat, cinq ans plus tôt, est appliqué une seule fois aux cohortes françaises si la correction est activée.")
+        st.write("Chaque cohorte supplémentaire est répartie selon la matrice diplôme → exercice observée à l'année d'ancrage, puis selon les parts départementales observées dans chaque région d'exercice. Les destinations hors France restent au dénominateur. Les cohortes sont cumulées sans attrition ni retraite supplémentaire jusqu'en 2070 ; les cohortes déjà arrivées ne sont pas redistribuées à chaque nouvelle année.")
+        st.caption("Le tableau donne l’effet de +1 % pour la première cohorte supplémentaire ; les cohortes suivantes s’accumulent. Les volumes dépendent du scénario DREES. Les lieux de diplôme ultramarins sont groupés : Antilles-Guyane et La Réunion-Mayotte. Une région sans correspondance observée conserve un curseur désactivé ; ses habitants peuvent recevoir des psychiatres formés ailleurs.")
         st.dataframe(calibration_table(reference, context, scenario_drees, proposed, state["national_flows"], state["intervention_routing"], state["training_cohorts"]), hide_index=True, width="stretch")
-        missing = [REGIONS[code] for code in REGIONS if code not in context["available"]]
+        missing = [TRAINING_REGIONS[code] for code in TRAINING_REGIONS if code not in context["available"]]
         if missing:
             st.warning("Calibration de formation absente pour : " + ", ".join(missing) + ". Une ouverture ex nihilo nécessite des hypothèses supplémentaires ; le curseur reste désactivé. Ces régions peuvent recevoir des diplômés formés ailleurs.")
-        st.write(f"Dynamiques : régression des écarts d'effectif départemental à la référence nationale sur {proposed['dynamique']['debut']}–{anchor}. La référence vaut le total métropolitain de chaque année multiplié par la part d'effectif du département observée en {anchor}. Chaque pente est exprimée en psychiatres par an.")
+        st.write(f"Dynamiques : régression des écarts d'effectif départemental à la référence nationale sur {proposed['dynamique']['debut']}–{anchor}. La référence vaut le total français de chaque année multiplié par la part d'effectif du département observée en {anchor}. Chaque pente est exprimée en psychiatres par an.")
         st.write(f"Projection avant saturation = total national de référence × part départementale de {anchor} + pente départementale × années depuis {anchor}. Les pentes somment à zéro. L'effet commence dès {anchor + 1}. Le lissage sous 1 psychiatre et la renormalisation préservent des effectifs non négatifs et le total national.")
         if metadata["mode_projection"] == "regional":
             st.write(f"Lorsque les dynamiques sont activées, le total des projections régionales sert de trajectoire nationale : leur ventilation régionale est remplacée par les parts {anchor} et les écarts départementaux. Désactiver les dynamiques rétablit la ventilation régionale de référence.")
-        st.write(f"Installations selon le lieu de diplôme : {proposed['mobilite']['methode']} ; départs à la retraite {proposed['mobilite']['retraite']:.1f} % par an ; estimation à partir de {proposed['mobilite']['debut']}. Le code 99 désigne le lieu du diplôme (étranger), pas la nationalité ; sa tendance démographique reste active à 0 % de hausse.")
+        st.write(f"Correspondance diplôme → exercice : parts fixes en {anchor}. La tendance nationale du stock de diplômés étrangers est estimée depuis {proposed['mobilite']['debut']}, sans taux de retraite. Le curseur majore uniquement son accroissement net positif, qui ne mesure pas les entrées brutes. Le code 99 désigne le lieu du diplôme, pas la nationalité.")
+        st.caption("Le retrait des pédopsychiatres repose sur les qualifications enfant/adolescent du RPPS (SM43 et SM92), pas sur toute l'activité de soins réalisée auprès des enfants. Le taux national observé de chaque année s'applique uniformément ; le dernier taux est maintenu en projection.")
         with st.expander("Sources et champ des effectifs"):
             st.write(f"Onglet de projection des actifs : {metadata['onglet_drees']}.")
             if metadata["mode_projection"] == "national":
@@ -2745,7 +2944,7 @@ def render_projections_page(app, scenarios_page):
                 st.write("Les effectifs régionaux DREES de référence sont utilisés directement. Le RPPS comprend tous les âges, contre 70 ans ou moins pour les actifs DREES : une rupture de champ peut apparaître au raccord.")
             st.write("Les résultats sont des nombres de psychiatres et une part salariée en %. Les observations proviennent directement de l’onglet Effectifs. Les valeurs projetées fractionnaires représentent des effectifs attendus.")
             st.write("Aucun fichier de projections n'est écrit. Le calcul de référence est partagé en mémoire ; les paramètres et résultats simulés appartiennent à chaque session.")
-        st.caption("Les formules, limites et règles d'extension sont détaillées dans README.md.")
+        st.caption("Politiques nationales : prévalence × produit des coefficients (1 − baisse × montée en charge), uniquement dans les âges et années ciblés. Les populations des tranches Insee sont réparties au prorata des âges ; aucun taux propre aux 12–17 ans n'est déduit des taux adultes.")
 
 
 def main():
