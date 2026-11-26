@@ -52,6 +52,7 @@ import re
 import unicodedata
 import urllib.request
 from io import BytesIO, StringIO
+from html import escape
 
 import numpy as np
 import pandas as pd
@@ -95,12 +96,23 @@ ACTS_PER_PSY = "Actes annuels par psychiatre"
 AVAILABLE_ACTS = "Actes disponibles pour le besoin sélectionné"
 REQUIRED_ACTS = "Actes nécessaires pour le besoin sélectionné"
 ACTS_BALANCE = "Solde d’actes par habitant et par an"
+PSY_TARGET = "Effectif cible estimé de psychiatres"
+PSY_BALANCE = "Solde de psychiatres par rapport à la cible"
+PSY_SHORTFALL = "Psychiatres manquants pour atteindre la cible"
+PSY_SURPLUS = "Psychiatres au-dessus de la cible"
+NEED_COVERAGE = "Couverture théorique des actes nécessaires (%)"
+RESIDENTS_PER_PSY = "Habitants par psychiatre"
 MATCH_INDICATORS = {"actes_par_psychiatre": ACTS_PER_PSY, "actes_disponibles": AVAILABLE_ACTS,
-                    "actes_necessaires": REQUIRED_ACTS, "solde_actes_habitant": ACTS_BALANCE}
+                    "actes_necessaires": REQUIRED_ACTS, "solde_actes_habitant": ACTS_BALANCE,
+                    "psychiatres_cibles": PSY_TARGET, "solde_psychiatres": PSY_BALANCE,
+                    "psychiatres_manquants": PSY_SHORTFALL, "psychiatres_surplus": PSY_SURPLUS,
+                    "couverture_actes_pct": NEED_COVERAGE, "habitants_par_psychiatre": RESIDENTS_PER_PSY}
+ACTIVITY_INDICATORS = ("actes_par_psychiatre", "actes_disponibles", "actes_necessaires", "solde_actes_habitant")
 # 15,865 millions de consultations/téléconsultations / 6 308 psychiatres libéraux (CNAM 2024).
 # Les autres valeurs sont des hypothèses de scénario, pas des normes de soins.
 MATCH_DEFAULTS = {"actes_liberal": 2515.0, "ratio_salarie": 0.65, "croissance_activite": 0.0,
-                  "actes_par_besoin": 8.0, "couverture": 25.0, "part_offre": 50.0}
+                  "actes_par_besoin": 8.0, "couverture": 25.0, "part_offre": 50.0,
+                  "marge_activite": 10.0}
 MATCH_SOURCES = {
     "Activité libérale CNAM 2024": "https://www.assurance-maladie.ameli.fr/sites/default/files/2024_fiche_psychiatres-et-neuro-psychiatres-liberaux.pdf",
     "Suivi individualisé HAS": "https://www.has-sante.fr/jcms/pprd_2974237/fr/depression-de-l-adulte-reperage-et-prise-en-charge-initiale",
@@ -1331,6 +1343,8 @@ MATCH_CONTROLS = (
     ("actes_par_besoin", "Actes annuels par personne ciblée", 0.0, 100.0, 1.0, "Hypothèse initiale : 8 actes équivalents par an. Ordre de grandeur descriptif, pas une recommandation clinique par trouble."),
     ("couverture", "Couverture cible du besoin par un psychiatre (%)", 0.0, 100.0, 5.0, "Part des personnes avec besoin potentiel ciblée par un suivi psychiatrique. 25 % est une hypothèse de scénario, pas un taux observé."),
     ("part_offre", "Part des actes mobilisable pour ce besoin (%)", 0.0, 100.0, 5.0, "50 % est une hypothèse de scénario pour réserver une part de l'activité aux troubles et âges hors référentiel. Ce paramètre évite d'affecter implicitement toute l'offre à un seul besoin."),
+    ("marge_activite", "Variation d'activité pour la fourchette d'effectif cible (± %) ", 0.0, 50.0, 1.0,
+     "Hypothèse de sensibilité : ±10 % par défaut autour de l'activité mobilisable d'un psychiatre. Une activité plus élevée donne la borne basse d'effectif ; une activité plus faible donne la borne haute. Ce n'est pas un intervalle de confiance. Mettre 0 pour une cible unique."),
 )
 # Regroupement des modulations sur la page Scénarios.
 SCENARIO_GROUPS = (("Paramètres structurels", ("perimetre", "dynamique", "internat", "mobilite")),
@@ -1409,6 +1423,8 @@ def predefined_scenarios(registry, context, match_values):
 def complete_matching(scenario, defaults):
     """Compléter les listes offre/demande d'un scénario créé sans données de demande."""
     result = deepcopy(scenario)
+    for key, value in MATCH_DEFAULTS.items():
+        result["rapprochement"].setdefault(key, value)
     for key, _ in MATCH_CHOICES:
         if result["rapprochement"].get(key) is None:
             result["rapprochement"][key] = defaults[key]
@@ -1847,7 +1863,7 @@ def load_geojson():
 
 
 def dynamics_diagnostic(panel, contributions, context, scenario):
-    """Écarts d'effectif à une référence nationale commune aux deux vues."""
+    """Écarts territoriaux, à périmètre identique entre effectif et référence."""
     if not panel.index.equals(contributions.index):
         raise ValueError("Diagnostic et projection désalignés.")
     diagnostic = panel[panel.scenario == scenario].copy()
@@ -1860,14 +1876,20 @@ def dynamics_diagnostic(panel, contributions, context, scenario):
     diagnostic["ajout_formation"] = pieces.formation
     diagnostic["avant_ajouts"] = pieces.reference + pieces.dynamique + pieces.internat
     diagnostic["hors_formation"] = diagnostic.avant_ajouts + pieces.etranger_tendance + pieces.immigration
-    diagnostic["reference_nationale"] = count_reference(diagnostic, context["baseline"], "avant_ajouts")
-    diagnostic["ecart_hors_formation"] = diagnostic.hors_formation - diagnostic.reference_nationale
+    # Les diplômés à l'étranger sont déjà inclus des deux côtés dans l'observé.
+    # En projection, leur croissance doit aussi entrer dans le total national
+    # comparé au département. Même règle pour les ajouts de politique publique :
+    # une hausse répartie selon les parts à l'ancrage ne crée aucun écart territorial.
+    diagnostic["reference_nationale_hors_formation"] = count_reference(
+        diagnostic, context["baseline"], "hors_formation")
+    diagnostic["reference_nationale"] = count_reference(diagnostic, context["baseline"], "effectif")
+    diagnostic["ecart_hors_formation"] = diagnostic.hors_formation - diagnostic.reference_nationale_hors_formation
     diagnostic["ecart_complet"] = diagnostic.effectif - diagnostic.reference_nationale
     return diagnostic
 
 
 def dynamics_figure(diagnostic, context, departments, full=False, start_year=None, show_fit=False):
-    """Observé puis extrapolation ; les nouvelles places sont une vue distincte."""
+    """Observé puis projeté, comparés au total national du même périmètre."""
     anchor = context["anchor"]
     start_year = context["observed_start"] if start_year is None else start_year
     trends = estimate_department_trends(context["history"], context["baseline"], start_year, anchor).set_index("dep")
@@ -1891,8 +1913,9 @@ def dynamics_figure(diagnostic, context, departments, full=False, start_year=Non
                                        name=f"{label} — droite estimée", legendgroup=dep, showlegend=False,
                                        line={"color": colors[index % len(colors)], "dash": "dot", "width": 1}, opacity=0.6,
                                        hovertemplate="%{x} : %{y:.2f} psychiatres<extra>%{fullData.name}</extra>"))
+    scope_label = "tous effets inclus" if full else "hors ouvertures de places"
     figure.add_hline(y=0, line_color="#64748b", line_width=1,
-                    annotation_text=f"Part nationale fixée en {anchor}, avant évolution étrangère et nouvelles places")
+                    annotation_text=f"Part nationale de {anchor} × total national du scénario ({scope_label})")
     figure.add_vline(x=anchor, line_color="#94a3b8", line_dash="dot")
     figure.update_layout(height=570, xaxis_title="Année", yaxis_title="Écart à la référence nationale (nombre de psychiatres)",
                          margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified")
@@ -2216,9 +2239,10 @@ def prepare_total_population(frame, baseline, demographic_scenario, explicit_tot
 
 def validate_match_parameters(parameters):
     limits = {"actes_liberal": (0, 20000), "ratio_salarie": (0, 2), "croissance_activite": (-5, 5),
-              "actes_par_besoin": (0, 100), "couverture": (0, 100), "part_offre": (0, 100)}
+              "actes_par_besoin": (0, 100), "couverture": (0, 100), "part_offre": (0, 100),
+              "marge_activite": (0, 50)}
     for name, (lo, hi) in limits.items():
-        value = parameters[name]
+        value = parameters.get(name, MATCH_DEFAULTS[name])
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or not lo <= value <= hi:
             raise ValueError(f"Paramètre offre/demande invalide : {name}.")
 
@@ -2292,10 +2316,138 @@ def compute_supply_demand(panel, demand, population, parameters, baseline, ancho
     result["actes_necessaires"] = result.personnes_ciblees * parameters["actes_par_besoin"]
     result["solde_actes"] = result.actes_disponibles - result.actes_necessaires
     result["solde_actes_habitant"] = result.solde_actes / result.population_total
-    numeric = list(MATCH_INDICATORS) + ["actes_totaux", "solde_actes"]
+    numeric = list(ACTIVITY_INDICATORS) + ["actes_totaux", "solde_actes"]
     if not np.isfinite(result[numeric]).all().all():
         raise ValueError("Résultat offre/demande non fini.")
+    return add_psychiatrist_targets(result, parameters, baseline)
+
+
+def add_psychiatrist_targets(result, parameters, baseline):
+    """Effectif requis pour le besoin sélectionné, à activité et mix de statuts fixés."""
+    result = result.copy()
+    count = result.effectif.to_numpy(dtype=float)
+    # Même mix salariés/libéraux que l'offre simulée. En cas d'effectif nul,
+    # garder le mix observé du département pour valoriser les recrutements possibles.
+    base = baseline.set_index("dep")
+    total = float(baseline.effectif.sum())
+    national_share = float(baseline.salaries.sum() / total) if total > 0 else np.nan
+    base_shares = base.part_salaries.where(base.effectif > 0, national_share)
+    fallback = result.dep.map(base_shares).to_numpy(dtype=float)
+    share = np.divide(result.salaries.to_numpy(dtype=float), count, out=fallback.copy(), where=count > 0)
+    if not np.isfinite(share).all() or ((share < 0) | (share > 1)).any():
+        raise ValueError("Mix salariés/libéraux indisponible pour estimer l'effectif cible.")
+    result["mix_cible_salaries"] = share
+    result["mix_cible_repli"] = count <= 0
+    activity = (1 - share) * result.actes_liberal.to_numpy() + share * result.actes_salarie.to_numpy()
+    result["capacite_mobilisable_par_psychiatre"] = activity * parameters["part_offre"] / 100.0
+    capacity = result.capacite_mobilisable_par_psychiatre.to_numpy()
+    required = result.actes_necessaires.to_numpy(dtype=float)
+    target = np.divide(required, capacity, out=np.full(len(result), np.nan), where=capacity > 0)
+    target[required == 0] = 0.0
+    margin = parameters.get("marge_activite", MATCH_DEFAULTS["marge_activite"]) / 100.0
+    result["psychiatres_cibles"] = target
+    result["psychiatres_cibles_bas"] = target / (1 + margin)
+    result["psychiatres_cibles_haut"] = target / (1 - margin)
+    result["solde_psychiatres"] = count - target
+    result["psychiatres_manquants"] = (target - count).clip(min=0)
+    result["psychiatres_surplus"] = (count - target).clip(min=0)
+    result["manque_minimal_fourchette"] = (result.psychiatres_cibles_bas - count).clip(lower=0)
+    result["surplus_fourchette"] = (count - result.psychiatres_cibles_haut).clip(lower=0)
+    result["couverture_actes_pct"] = np.divide(100 * result.actes_disponibles.to_numpy(), required,
+        out=np.full(len(result), np.nan), where=required > 0)
+    result["habitants_par_psychiatre"] = np.divide(result.population_total.to_numpy(), count,
+        out=np.full(len(result), np.nan), where=count > 0)
+    result["personnes_ciblees_par_psychiatre"] = np.divide(result.personnes_ciblees.to_numpy(), count,
+        out=np.full(len(result), np.nan), where=count > 0)
+    lower, upper = result.psychiatres_cibles_bas, result.psychiatres_cibles_haut
+    tolerance = 1e-9 * np.maximum(1, np.nan_to_num(target))
+    result["statut_couverture"] = np.select(
+        [required == 0, ~np.isfinite(target), count < lower - tolerance, count > upper + tolerance],
+        ["Aucun besoin ciblé", "Capacité mobilisable nulle", "Sous la fourchette cible", "Au-dessus de la fourchette cible"],
+        default="Dans la fourchette cible")
     return result
+
+
+def format_quantity(value, decimals=0, suffix="", signed=False):
+    if value is None or not np.isfinite(value):
+        return "Non calculable"
+    spec = f"{'+' if signed else ''},.{decimals}f"
+    return format(float(value), spec).replace(",", "\u202f").replace(".", ",") + suffix
+
+
+def target_card_values(row, parameters):
+    """Libellés identiques sur la carte et dans la fiche départementale."""
+    finite = np.isfinite(row.psychiatres_cibles)
+    if not finite:
+        gap_label, gap = "Manque / surplus", "Non calculable"
+    elif row.manque_minimal_fourchette > 1e-7:
+        gap_label, gap = "Manque minimal", format_quantity(row.manque_minimal_fourchette, 1)
+    elif row.surplus_fourchette > 1e-7:
+        gap_label, gap = "Au-delà de la fourchette", "+" + format_quantity(row.surplus_fourchette, 1)
+    else:
+        gap_label, gap = "Écart à la cible centrale", format_quantity(row.solde_psychiatres, 1, signed=True)
+    margin = parameters.get("marge_activite", MATCH_DEFAULTS["marge_activite"])
+    band = (format_quantity(row.psychiatres_cibles_bas, 1) + " – " + format_quantity(row.psychiatres_cibles_haut, 1)
+            if finite and margin > 0 else format_quantity(row.psychiatres_cibles, 1))
+    status = str(row.statut_couverture)
+    tone = ("red" if status == "Sous la fourchette cible" else "green" if status == "Au-dessus de la fourchette cible"
+            else "amber" if status == "Dans la fourchette cible" else "neutral")
+    return {"nom": str(row.nom), "annee": str(int(row.annee)), "population": format_quantity(row.population_total),
+            "effectif": format_quantity(row.effectif, 1), "habitants_par_psy": format_quantity(row.habitants_par_psychiatre),
+            "personnes_ciblees": format_quantity(row.personnes_ciblees), "cible": format_quantity(row.psychiatres_cibles, 1),
+            "fourchette": band, "ecart_label": gap_label, "ecart": gap,
+            "couverture": format_quantity(row.couverture_actes_pct, 1, " %"), "statut": status, "ton": tone,
+            "capacite": format_quantity(row.capacite_mobilisable_par_psychiatre, 1),
+            "besoin": format_quantity(row.actes_necessaires), "marge": format_quantity(margin),
+            "mix_repli": bool(row.mix_cible_repli)}
+
+
+def territory_hover(row, parameters, label):
+    v = target_card_values(row, parameters)
+    color = {"red": "#b93855", "green": "#397d52", "amber": "#936a25", "neutral": "#65707c"}[v["ton"]]
+    lines = [f"<b>{escape(v['nom'])}</b> · {v['annee']}",
+             f"Population : <b>{v['population']}</b>", f"Psychiatres : <b>{v['effectif']}</b>",
+             f"Habitants / psychiatre : <b>{v['habitants_par_psy']}</b>",
+             f"Personnes ciblées : <b>{v['personnes_ciblees']}</b>",
+             f"Effectif cible estimé : <b>{v['cible']}</b>", f"Fourchette : <b>{v['fourchette']}</b>",
+             f"{v['ecart_label']} : <b>{v['ecart']}</b>", f"Couverture des actes : <b>{v['couverture']}</b>",
+             f"<span style='color:{color}'><b>{escape(v['statut'])}</b></span>",
+             f"<span style='font-size:11px'>{escape(label)}</span>"]
+    return "<br>".join(lines)
+
+
+def territory_card_html(row, parameters, label):
+    v = target_card_values(row, parameters)
+    def item(label, value, emphasis=False):
+        css = " psy-card-focus" if emphasis else ""
+        return f'<div class="psy-card-row{css}"><span>{escape(label)}</span><strong>{escape(value)}</strong></div>'
+    items = "".join([item("Population", v["population"]), item("Psychiatres", v["effectif"]),
+        item("Habitants / psychiatre", v["habitants_par_psy"]), item("Personnes ciblées", v["personnes_ciblees"]),
+        item("Effectif cible estimé", v["cible"], True), item("Fourchette d'effectif cible", v["fourchette"]),
+        item(v["ecart_label"], v["ecart"]), item("Couverture des actes nécessaires", v["couverture"])])
+    note = "Mix de statuts de la dernière année observée utilisé pour estimer les recrutements." if v["mix_repli"] else "Mix salariés/libéraux du département conservé pour estimer la cible."
+    return f'''<div class="psy-territory-card">
+<div class="psy-card-heading"><strong>{escape(v['nom'])}</strong><span>{v['annee']}</span></div>
+<div class="psy-card-subtitle">{escape(label)}</div>{items}
+<div class="psy-card-status psy-card-{v['ton']}"><small>COUVERTURE THÉORIQUE</small><strong>{escape(v['statut'])}</strong></div>
+<div class="psy-card-footnote">Fourchette : activité par psychiatre ±{v['marge']} %. Hypothèse de sensibilité, pas un intervalle de confiance. {escape(note)}</div>
+</div>'''
+
+
+def target_evolution_figure(detail, department):
+    rows = detail[detail.dep == department].sort_values("annee")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=rows.annee, y=rows.psychiatres_cibles_bas, mode="lines", line=dict(width=0),
+                            showlegend=False, hoverinfo="skip", connectgaps=False))
+    fig.add_trace(go.Scatter(x=rows.annee, y=rows.psychiatres_cibles_haut, mode="lines", line=dict(width=0),
+                            fill="tonexty", fillcolor="rgba(90,145,120,.16)", name="Fourchette cible", hoverinfo="skip", connectgaps=False))
+    fig.add_trace(go.Scatter(x=rows.annee, y=rows.psychiatres_cibles, mode="lines", name="Effectif cible estimé",
+                            line=dict(color="#3e7954", width=2, dash="dash"), connectgaps=False))
+    fig.add_trace(go.Scatter(x=rows.annee, y=rows.effectif, mode="lines", name="Psychiatres disponibles",
+                            line=dict(color="#354f70", width=3)))
+    fig.update_layout(height=430, margin=dict(l=10, r=10, t=15, b=10), hovermode="x unified",
+                      xaxis_title="Année", yaxis_title="Nombre de psychiatres", legend=dict(orientation="h", y=-.2))
+    return fig
 
 
 def match_projections_frame(detail):
@@ -2358,7 +2510,7 @@ def ensure_matching(state, demand, population, parameters, context, activity=Non
 
 
 def render_match_tab(matching, error, scenario, year, names):
-    st.write("Le solde compare des actes annuels équivalents de consultation pour le besoin sélectionné : (actes disponibles − actes nécessaires) / population totale du département.")
+    st.write("L'effectif cible estime le nombre de psychiatres nécessaire pour produire les actes requis par le besoin sélectionné. Il conserve le mix salariés/libéraux et la part d'activité mobilisable du scénario.")
     st.caption("Un solde négatif indique un manque ; un solde positif indique une marge théorique dans le périmètre choisi. Il ne mesure pas des rendez-vous réellement libres ni un excédent pour l'ensemble de la psychiatrie.")
     if matching is None:
         st.info(error or "Renseigner les données et paramètres de rapprochement sur la page Scénarios.")
@@ -2375,18 +2527,49 @@ def render_match_tab(matching, error, scenario, year, names):
     a.metric("Actes disponibles — France", f"{selected.actes_disponibles.sum():,.0f}".replace(",", " "))
     b.metric("Actes nécessaires — France", f"{selected.actes_necessaires.sum():,.0f}".replace(",", " "))
     c.metric("Solde annuel par habitant — France", f"{selected.solde_actes.sum() / selected.population_total.sum():+.3f}")
+    staffing_a, staffing_b, staffing_c = st.columns(3)
+    staffing_a.metric("Psychiatres disponibles — France", format_quantity(selected.effectif.sum(), 1))
+    staffing_b.metric("Effectif cible estimé — France", format_quantity(selected.psychiatres_cibles.sum(skipna=False), 1))
+    staffing_c.metric("Manques départementaux cumulés", format_quantity(selected.psychiatres_manquants.sum(skipna=False), 1),
+                      help="Somme des manques par rapport à la cible centrale. Un surplus dans un département ne compense pas automatiquement un manque ailleurs.")
+    unavailable = int(selected.psychiatres_cibles.isna().sum())
+    if unavailable:
+        st.info(f"Effectif cible non calculable dans {unavailable} département(s) : besoin positif mais capacité mobilisable par psychiatre nulle. Les totaux de cible incomplets ne sont pas affichés comme des totaux nationaux.")
+    st.caption(f"Fourchette : activité par psychiatre ±{params.get('marge_activite', MATCH_DEFAULTS['marge_activite']):g} %. Hypothèse de sensibilité, sans valeur de norme clinique.")
     departments = st.multiselect("Départements du rapprochement", sorted(names), default=["75"] if "75" in names else [sorted(names)[0]], format_func=lambda dep: f"{dep} · {names[dep]}", key="match_departments")
     shown = detail[detail.dep.isin(departments)].copy()
     shown["Département"] = shown.dep.map(names)
     if not shown.empty:
-        figure = px.line(shown, x="annee", y="solde_actes_habitant", color="Département", labels={"annee": "Année", "solde_actes_habitant": "Solde annuel d’actes par habitant"})
-        figure.add_hline(y=0, line_dash="dot", line_color="#475569")
-        st.plotly_chart(figure, width="stretch")
+        graph = st.selectbox("Évolution à afficher", [PSY_TARGET, PSY_BALANCE, NEED_COVERAGE, ACTS_BALANCE], key="matching_evolution")
+        if graph == PSY_TARGET and len(departments) == 1:
+            figure = target_evolution_figure(detail, departments[0])
+        elif graph == PSY_TARGET:
+            figure = go.Figure()
+            for index, department in enumerate(departments):
+                series = shown[shown.dep == department].sort_values("annee")
+                color = px.colors.qualitative.Dark24[index % len(px.colors.qualitative.Dark24)]
+                figure.add_trace(go.Scatter(x=series.annee, y=series.effectif, name=f"{names[department]} · offre", line=dict(color=color)))
+                figure.add_trace(go.Scatter(x=series.annee, y=series.psychiatres_cibles, name=f"{names[department]} · cible", line=dict(color=color, dash="dash")))
+            figure.update_layout(xaxis_title="Année", yaxis_title="Nombre de psychiatres", hovermode="x unified")
+        else:
+            column = next(key for key, label in MATCH_INDICATORS.items() if label == graph)
+            figure = px.line(shown, x="annee", y=column, color="Département", labels={"annee": "Année", column: graph})
+            figure.add_hline(y=100 if graph == NEED_COVERAGE else 0, line_dash="dot", line_color="#475569")
+        st.plotly_chart(figure, width="stretch", key="matching_evolution_chart")
     selected.insert(1, "nom", selected.dep.map(names))
-    st.dataframe(selected[["dep", "nom", "annee", "population_total", "persons_with_need", "personnes_ciblees", "actes_par_psychiatre", "actes_totaux", "actes_disponibles", "actes_necessaires", "solde_actes", "solde_actes_habitant"]].rename(columns={
+    st.dataframe(selected[["dep", "nom", "annee", "population_total", "effectif", "persons_with_need", "personnes_ciblees", "psychiatres_cibles", "psychiatres_cibles_bas", "psychiatres_cibles_haut", "solde_psychiatres", "psychiatres_manquants", "psychiatres_surplus", "couverture_actes_pct", "statut_couverture", "actes_par_psychiatre", "actes_totaux", "actes_disponibles", "actes_necessaires", "solde_actes", "solde_actes_habitant"]].rename(columns={
+        "effectif": "Psychiatres disponibles", "psychiatres_cibles": PSY_TARGET, "psychiatres_cibles_bas": "Cible basse", "psychiatres_cibles_haut": "Cible haute",
+        "solde_psychiatres": PSY_BALANCE, "psychiatres_manquants": PSY_SHORTFALL, "psychiatres_surplus": PSY_SURPLUS,
+        "couverture_actes_pct": NEED_COVERAGE, "statut_couverture": "Situation théorique",
         "annee": "Année", "population_total": "Population totale", "persons_with_need": "Personnes avec besoin potentiel", "personnes_ciblees": "Personnes ciblées", "actes_par_psychiatre": ACTS_PER_PSY,
         "actes_totaux": "Actes totaux avant affectation", "actes_disponibles": AVAILABLE_ACTS, "actes_necessaires": REQUIRED_ACTS, "solde_actes": "Solde annuel d’actes", "solde_actes_habitant": ACTS_BALANCE}), hide_index=True, width="stretch")
+    exported = detail.assign(nom=detail.dep.map(names))
+    st.download_button("Exporter les effectifs cibles et le rapprochement annuel", exported.to_csv(index=False).encode("utf-8-sig"),
+                       "effectifs_cibles_psychiatres.csv", "text/csv", key="export_targets")
     with st.expander("Hypothèses et sources du rapprochement"):
+        st.latex(r"N_{\mathrm{cible}} = \frac{\mathrm{Personnes\ avec\ besoin} \times \mathrm{Couverture\ cible} \times \mathrm{Actes/personne}}{\mathrm{Actes/psychiatre} \times \mathrm{Part\ mobilisable}}")
+        st.write("La cible centrale est un effectif attendu, éventuellement fractionnaire. La borne basse divise les actes nécessaires par une capacité accrue de la marge choisie ; la borne haute utilise une capacité diminuée de cette marge. Manques et surplus des indicateurs sont calculés par rapport à la cible centrale ; la fiche indique aussi le manque minimal ou le dépassement de la fourchette.")
+        st.write("Si aucun psychiatre n'est disponible, la cible reste calculable avec le mix de statuts observé à l'ancrage. Si la capacité mobilisable est nulle alors que le besoin est positif, la cible est signalée comme non calculable. Un besoin ciblé nul donne une cible nulle et aucun taux de couverture n'est calculé.")
         st.write("Productivité par statut × effectifs projetés = actes totaux. La part mobilisable limite l'offre au périmètre choisi. Personnes avec besoin × couverture cible × actes par personne = actes nécessaires. Les actes annuels ne sont pas cumulés entre années.")
         st.write("Les valeurs initiales de 8 actes, 25 % de couverture et 50 % d'offre mobilisable sont des hypothèses ajustables, pas un référentiel clinique validé. Les actes libéraux et salariés sont exprimés en équivalents de consultation ; l'hospitalisation et le travail en équipe ne sont pas directement comparables aux consultations facturées.")
         st.write("La population totale tous âges est requise. La population à risque des 18–79 ans ou des 6–11 ans n'est jamais utilisée comme substitut. Le cumul adulte dépression/anxiété conserve l'hypothèse d'absence de recouvrement du modèle de demande.")
@@ -2418,6 +2601,23 @@ PAGE_STYLE = f"""<style>
 .st-key-map_box {{height: calc({MAP_SCALE} * (100vh - {MAP_RESERVED_HEIGHT}px)) !important;
                   min-height: {round(MAP_SCALE * MAP_MIN_HEIGHT)}px;
                   flex: 0 0 auto !important;}}
+
+.psy-territory-card {{max-width: 520px; background: #fff; color: #25282c; border: 1px solid #e0e3e6;
+ border-radius: 18px; padding: 24px 26px; box-shadow: 0 10px 30px rgba(20,34,46,.09); margin: 8px 0 18px;}}
+.psy-card-heading {{display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:8px;}}
+.psy-card-heading strong {{font-size:27px; font-weight:750;}}.psy-card-heading span {{font-size:18px; color:#777;}}
+.psy-card-subtitle {{font-size:12px; color:#73808a; margin-bottom:14px; line-height:1.4;}}
+.psy-card-row {{display:flex; align-items:baseline; justify-content:space-between; gap:20px; border-bottom:1px solid #eceef0; padding:10px 0; font-size:16px;}}
+.psy-card-row span {{color:#71777d;}}.psy-card-row strong {{font-size:18px; font-weight:650; text-align:right; white-space:nowrap;}}
+.psy-card-focus {{border-top:1px dashed #cdd4da; margin-top:8px; padding-top:15px;}}
+.psy-card-focus strong {{font-size:23px; color:#315f48;}}.psy-card-status {{margin-top:18px; padding:12px 16px; border-left:5px solid; border-radius:0 8px 8px 0;}}
+.psy-card-status small {{display:block; font-size:12px; color:#68716e; letter-spacing:.06em;}}
+.psy-card-status strong {{display:block; margin-top:3px; font-size:19px; line-height:1.35;}}
+.psy-card-red {{background:#fbf0f3; border-color:#b93855; color:#a82d4a;}}
+.psy-card-green {{background:#edf5ef; border-color:#50895e; color:#397447;}}
+.psy-card-amber {{background:#faf5e9; border-color:#b18a34; color:#876421;}}
+.psy-card-neutral {{background:#f2f4f6; border-color:#82909b; color:#5b6770;}}
+.psy-card-footnote {{font-size:11px; color:#7d858c; line-height:1.5; margin-top:14px;}}
 </style>"""
 
 
@@ -2643,7 +2843,7 @@ def render_map_tab(app, df, demand, demand_error, matching, matching_error, scen
             rows = df[df.indicateur == indicator]
         elif family == FAMILY_MATCH:
             options = list(MATCH_INDICATORS.values())
-            indicator = indicator_col.selectbox("Indicateur", options, key="map_indicator_match")
+            indicator = indicator_col.selectbox("Indicateur", options, index=options.index(PSY_TARGET), key="map_indicator_match")
             rows = matching["projections"] if matching is not None else df.iloc[0:0]
             rows = rows[rows.indicateur == indicator]
         else:
@@ -2679,6 +2879,24 @@ def render_map_tab(app, df, demand, demand_error, matching, matching_error, scen
         scale_values = rows.valeur
     selected = selected[["dep", "valeur"]].copy() if not selected.empty else pd.DataFrame(columns=["dep", "valeur"])
     selected["nom"] = selected.dep.map(names)
+    map_matching = matching
+    if family == FAMILY_DEMAND and indicator is not None and demand is not None and indicator[0] != scenario["rapprochement"].get("need_indicator"):
+        try:
+            map_parameters = {**scenario["rapprochement"], "need_indicator": indicator[0]}
+            population, activity = optional_match_inputs()
+            map_matching = ensure_matching(st.session_state.psy_projection, demand, population, map_parameters, context, activity)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            map_matching = None
+            st.info(f"Effectif cible indisponible pour ce besoin : {exc}")
+    card_detail = None
+    if map_matching is not None:
+        card_detail = map_matching["detail"]
+        card_detail = card_detail[(card_detail.scenario == drees) & (card_detail.annee == year)].copy()
+        if not card_detail.empty:
+            card_detail["nom"] = card_detail.dep.map(names)
+            label = labels.get(map_matching["parameters"]["need_indicator"], map_matching["parameters"]["need_indicator"])
+            card_detail["info_bulle"] = card_detail.apply(lambda row: territory_hover(row, map_matching["parameters"], label), axis=1)
+            selected = selected.merge(card_detail[["dep", "info_bulle"]], on="dep", how="left", validate="one_to_one")
     with map_area:
         if family == FAMILY_DEMAND and demand is None:
             st.warning(f"Demande de soins indisponible : {demand_error}" if demand_error else "Demande de soins indisponible.")
@@ -2690,7 +2908,7 @@ def render_map_tab(app, df, demand, demand_error, matching, matching_error, scen
             st.dataframe(selected.sort_values("valeur")[["dep", "nom", "valeur"]].rename(
                 columns={"dep": "Code", "nom": "Département", "valeur": value_label}), hide_index=True, width="stretch")
     if family == FAMILY_MATCH:
-        st.caption("Rapprochement annuel selon les paramètres offre / demande du scénario actif. Solde négatif : manque d'actes ; positif : marge théorique pour le besoin choisi. La carte est centrée sur zéro pour le solde, sans supprimer les valeurs négatives.")
+        st.caption("L'effectif cible est estimé à partir du besoin sélectionné et de la capacité mobilisable par psychiatre. Un solde de psychiatres négatif indique un manque par rapport à la cible centrale ; les manques et surplus sont également disponibles séparément. Les cartes de soldes sont centrées sur zéro.")
         if matching is not None:
             mp = matching["parameters"]
             st.caption(f"Référence du rapprochement : Insee {mp['demographic_scenario']} ; besoin {mp['need_scenario']} / {mp['need_indicator']} ; couverture {mp['couverture']:g} %, {mp['actes_par_besoin']:g} actes par personne ciblée, {mp['part_offre']:g} % de l'offre mobilisable.")
@@ -2701,21 +2919,43 @@ def render_map_tab(app, df, demand, demand_error, matching, matching_error, scen
                    "Ce n'est ni un recours observé, ni un nombre de psychiatres requis ; voir l'onglet Demande de soins.")
     else:
         st.caption("Salariés = salariés hospitaliers + autres salariés. Libéraux = libéraux exclusifs + exercice mixte. Chaque personne est comptée une seule fois ; la part salariée est en %.")
+    if card_detail is not None and not card_detail.empty:
+        with st.expander("Explorer un département : effectif disponible et cible", expanded=True):
+            departments = sorted(card_detail.dep.unique())
+            if st.session_state.get("target_department") not in departments:
+                st.session_state.target_department = "75" if "75" in departments else departments[0]
+            department = st.selectbox("Département à explorer", departments, key="target_department", format_func=lambda dep: f"{dep} · {names[dep]}")
+            row = card_detail[card_detail.dep == department].iloc[0]
+            label = labels.get(map_matching["parameters"]["need_indicator"], map_matching["parameters"]["need_indicator"])
+            left, right = st.columns([1, 1.55], vertical_alignment="top")
+            with left:
+                st.markdown(territory_card_html(row, map_matching["parameters"], label), unsafe_allow_html=True)
+            with right:
+                trend = map_matching["detail"].query("scenario == @drees")
+                st.plotly_chart(target_evolution_figure(trend, department), width="stretch", key="target_department_evolution")
+                st.caption("L'effectif cible concerne uniquement le besoin sélectionné, avec la couverture cible et la part d'activité mobilisable du scénario. La couverture théorique ne mesure pas les délais ni l'accès réel aux soins.")
     return drees, year
 
 
 def france_figure(selected, scale_values, value_label, indicator, gj):
     """Métropole et cinq encarts DROM, même échelle de couleur partout."""
-    is_share, is_balance = indicator == SALARIED_SHARE, indicator == ACTS_BALANCE
+    is_share, is_balance = indicator == SALARIED_SHARE, indicator in (ACTS_BALANCE, PSY_BALANCE)
+    scale_values = pd.to_numeric(scale_values, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
     if is_balance:
         bound = max(float(scale_values.abs().quantile(0.98)), 0.001) if not scale_values.empty else 1.0
         vmin, vmax = -bound, bound
+    elif indicator == NEED_COVERAGE:
+        vmin, vmax = 0.0, max(200.0, float(scale_values.quantile(.98))) if not scale_values.empty else 200.0
     else:
         vmin, vmax = (0.0, 100.0) if is_share else scale_values.quantile([0.02, 0.98]) if not scale_values.empty else (0.0, 1.0)
     if vmin == vmax:
         vmax = vmin + 1
-    unit = " %" if is_share else ""
-    number_format = "%{z:+.3f} acte/habitant/an" if is_balance else "%{z:,.1f}" + unit
+    unit = " %" if is_share or indicator == NEED_COVERAGE else ""
+    signed_scale = [[0, "#ad536f"], [.5, "#f6f4f3"], [1, "#5c9d77"]]
+    colorscale = signed_scale if is_balance else px.colors.sequential.Blues[1:]
+    if indicator == NEED_COVERAGE:
+        midpoint = 100 / vmax
+        colorscale = [[0, "#ad536f"], [midpoint, "#f6f4f3"], [min(1.0, midpoint + .12), "#81b28f"], [1, "#39754d"]]
     fig = go.Figure()
     panels = [("Métropole", METRO, [0.20, 0.88], [0, 1])]
     for index, (dep, label) in enumerate(DROM.items()):
@@ -2726,10 +2966,25 @@ def france_figure(selected, scale_values, value_label, indicator, gj):
         geo = "geo" if index == 0 else f"geo{index + 1}"
         subset = selected[selected.dep.isin(codes)]
         contours = {"type": "FeatureCollection", "features": [f for f in gj["features"] if f["properties"]["code"] in codes]}
-        fig.add_trace(go.Choropleth(geo=geo, geojson=contours, locations=subset.dep, z=subset.valeur,
-            featureidkey="properties.code", coloraxis="coloraxis", text=subset.nom,
-            customdata=subset[["dep"]].to_numpy(), marker_line_color="white", marker_line_width=0.5,
-            hovertemplate="<b>%{text}</b> (%{customdata[0]})<br>" + number_format + "<extra></extra>"))
+        subset = subset.copy()
+        simple = pd.Series([
+            f"<b>{escape(str(row.nom))}</b> ({row.dep})<br>{escape(value_label)} : {format_quantity(row.valeur, 1)}"
+            for row in subset.itertuples()
+        ], index=subset.index, dtype="str")
+        subset["hover_card"] = subset.info_bulle.fillna(simple) if "info_bulle" in subset else simple
+        if "info_bulle" in subset and not subset.empty:
+            subset["hover_card"] += subset.valeur.map(lambda value: f"<br><i>{escape(value_label)} : {format_quantity(value, 1)}{unit}</i>")
+        valid = subset[np.isfinite(subset.valeur)]
+        fig.add_trace(go.Choropleth(geo=geo, geojson=contours, locations=valid.dep, z=valid.valeur,
+            featureidkey="properties.code", coloraxis="coloraxis", text=valid.nom,
+            customdata=valid[["hover_card"]].to_numpy(), marker_line_color="white", marker_line_width=0.5,
+            hovertemplate="%{customdata[0]}<extra></extra>"))
+        missing = subset[~np.isfinite(subset.valeur)]
+        if not missing.empty:
+            fig.add_trace(go.Choropleth(geo=geo, geojson=contours, locations=missing.dep, z=np.zeros(len(missing)),
+                featureidkey="properties.code", colorscale=[[0, "#d6dade"], [1, "#d6dade"]], showscale=False,
+                customdata=missing[["hover_card"]].to_numpy(), marker_line_color="white", marker_line_width=.5,
+                hovertemplate="%{customdata[0]}<extra></extra>"))
         layout[geo] = dict(domain=dict(x=xdomain, y=ydomain), visible=False, bgcolor="rgba(0,0,0,0)",
                            projection=dict(type="mercator"), fitbounds="locations")
         if index == 0:
@@ -2740,7 +2995,8 @@ def france_figure(selected, scale_values, value_label, indicator, gj):
                                showarrow=False, font=dict(size=11), xanchor="center", yanchor="middle")
     fig.update_layout(**layout, margin=dict(l=0, r=0, t=10, b=0), dragmode=False,
         paper_bgcolor="rgba(0,0,0,0)", separators=", ",
-        coloraxis=dict(cmin=float(vmin), cmax=float(vmax), colorscale="RdBu" if is_balance else px.colors.sequential.Blues[1:],
+        hoverlabel=dict(bgcolor="white", bordercolor="#dfe4e7", font=dict(size=14, color="#28313a", family="Arial, sans-serif"), align="left"),
+        coloraxis=dict(cmin=float(vmin), cmax=float(vmax), colorscale=colorscale,
                        colorbar=dict(title=dict(text=value_label, side="right"), thickness=14, len=0.7, outlinewidth=0)))
     return fig
 
@@ -2755,7 +3011,7 @@ def render_choropleth(selected, scale_values, value_label, indicator):
         return
     fig = france_figure(selected, scale_values, value_label, indicator, gj)
     st.plotly_chart(fig, width="stretch", height="stretch")
-    st.caption("France : 101 départements, France et cinq DROM. Encarts ultramarins à des échelles géographiques différentes ; couleurs comparables. Les collectivités d'outre-mer hors départements ne figurent pas dans ces données.")
+    st.caption("France : 101 départements, métropole et cinq DROM. Encarts ultramarins à des échelles géographiques différentes ; couleurs comparables. Les collectivités d'outre-mer hors départements ne figurent pas dans ces données.")
 
 
 def render_projections_page(app, scenarios_page):
@@ -2765,7 +3021,7 @@ def render_projections_page(app, scenarios_page):
     proposed = scenario["offre"]
     # En-tête sur une ligne : titre, scénario actif (détail au clic), lien vers Scénarios.
     title, detail, change = st.columns([3.3, 1.6, 1.25], vertical_alignment="center")
-    title.markdown("### Projections des effectifs de psychiatres par département")
+    title.markdown("### Psychiatres : offre, besoins et effectifs cibles")
     try:
         with st.spinner(f"Calcul du scénario « {scenario['nom']} »…"):
             df, metadata, recalculated = ensure_projections(signature, proposed, reference, metadata, context)
@@ -2834,7 +3090,8 @@ def render_projections_page(app, scenarios_page):
             st.info(f"Dynamique réellement appliquée : OUI, dès {anchor + 1}. Pente d'effectif estimée sur {start}–{anchor} puis raccordée à l'observation {anchor}.")
         else:
             st.warning("Dynamique réellement appliquée : NON. La tendance nationale des arrivées étrangères reste active, même avec le curseur à 0 %. Elle peut produire des écarts territoriaux. Des projections régionales détaillées peuvent aussi avoir leur propre évolution.")
-        st.write(f"Les courbes montrent un écart en nombre de psychiatres. Chaque effectif est comparé au total national après correction de l’internat, avant tendance étrangère et hausses des places ou des arrivées, multiplié par la part du département observée en {anchor}. Les courbes incluent tous les effets du scénario actif, ouvertures de places comprises.")
+        st.write(f"Les courbes montrent un écart en nombre de psychiatres. Chaque effectif départemental est comparé au total national de la même année et du même scénario, multiplié par la part du département observée en {anchor}. La correction de l’internat, la tendance des diplômés à l’étranger et les hausses de places ou d’arrivées sont incluses dans les deux termes de la comparaison.")
+        st.caption("Une hausse nationale répartie selon les parts départementales de l’année d’ancrage ne crée aucun écart. La somme des écarts de tous les départements vaut zéro chaque année. Les effets des politiques sur les effectifs restent visibles dans les indicateurs et la décomposition ci-dessous.")
         show_fit = st.checkbox("Afficher la droite estimée sur les observations", value=False, key="show_trend_fit")
         departments = st.multiselect("Départements à comparer", sorted(names), default=["75"] if "75" in names else [sorted(names)[0]],
                                      format_func=lambda dep: f"{dep} · {names[dep]}", key="trend_departments")
@@ -2857,10 +3114,12 @@ def render_projections_page(app, scenarios_page):
             with st.expander(f"Décomposition des effectifs en {year}"):
                 detail = diagnostic[(diagnostic.annee == year) & diagnostic.dep.isin(departments)].copy()
                 detail.insert(1, "nom", detail.dep.map(names))
-                st.dataframe(detail[["dep", "nom", "effectif_reference", "effet_dynamique", "effet_internat", "tendance_etranger", "ajout_immigration", "ajout_formation", "effectif"]].rename(
+                st.dataframe(detail[["dep", "nom", "effectif_reference", "effet_dynamique", "effet_internat", "tendance_etranger", "ajout_immigration", "ajout_formation", "effectif", "reference_nationale", "ecart_complet"]].rename(
                     columns={"effectif_reference": "Référence sans modulation", "effet_dynamique": "Effet départemental", "effet_internat": "Correction internat",
-                             "tendance_etranger": "Tendance étrangère / 2026", "ajout_immigration": "Hausse du curseur étranger", "ajout_formation": "Ajout des places", "effectif": "Effectif final"}), hide_index=True, width="stretch")
+                             "tendance_etranger": "Tendance étrangère / 2026", "ajout_immigration": "Hausse du curseur étranger", "ajout_formation": "Ajout des places", "effectif": "Effectif final",
+                             "reference_nationale": "Référence nationale du graphique", "ecart_complet": "Écart affiché"}), hide_index=True, width="stretch")
                 st.caption("L'effet départemental inclut la saturation et la renormalisation. L'ajout des places est un nombre de psychiatres supplémentaires, toujours positif ou nul.")
+                st.caption(f"Référence nationale du graphique = total national final du scénario × part du département en {anchor}. Écart affiché = effectif final − cette référence. Cette référence sert à la comparaison ; elle ne s’ajoute pas aux composantes de l’effectif.")
             if state["foreign_trend_limited_rows"]:
                 st.warning("L’écart cumulé des arrivées étrangères aurait rendu certains effectifs départementaux négatifs. Leur correction a été limitée à un effectif nul ; la décomposition montre le retrait effectivement appliqué.")
         else:
