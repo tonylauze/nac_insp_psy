@@ -79,8 +79,16 @@ def read_population_workbook(path: Path) -> tuple[pd.DataFrame, list[int]]:
     years = [int(str(column).split("_")[1]) for column in year_columns]
     required = ["ZONE", "SEXE", "TRAGE", *year_columns]
     frame = frame.loc[:, required].dropna(subset=["ZONE", "SEXE", "TRAGE"])
-    frame["SEXE"] = pd.to_numeric(frame["SEXE"], errors="raise").astype(int)
+    frame["SEXE"] = pd.to_numeric(frame["SEXE"], errors="raise")
+    if not frame["SEXE"].isin(SEX_CODES.values()).all():
+        raise ValueError(f"Code de sexe invalide dans {path.name}.")
+    frame["SEXE"] = frame["SEXE"].astype(int)
     frame["_band"] = frame["TRAGE"].map(parse_age_band)
+    frame[year_columns] = frame[year_columns].apply(pd.to_numeric, errors="raise")
+    if not np.isfinite(frame[year_columns].to_numpy(dtype=float)).all() or (frame[year_columns] < 0).any().any():
+        raise ValueError(f"Population manquante, négative ou non finie dans {path.name}.")
+    if frame.duplicated(["ZONE", "SEXE", "TRAGE"]).any():
+        raise ValueError(f"Population dupliquée par département, sexe et âge dans {path.name}.")
     return frame, years
 
 
@@ -96,6 +104,13 @@ def validate_parameters(parameters: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"Valeurs sex invalides : {invalid}; valeurs admises : {sorted(allowed_sexes)}")
     for column in ("age_min", "age_max", "baseline_rate"):
         parameters[column] = pd.to_numeric(parameters[column], errors="raise")
+    if not np.isfinite(parameters[["age_min", "age_max", "baseline_rate"]].to_numpy(dtype=float)).all():
+        raise ValueError("Les âges et prévalences doivent être renseignés et finis.")
+    ages = parameters[["age_min", "age_max"]]
+    if (ages < 0).any().any() or (ages % 1 != 0).any().any():
+        raise ValueError("Les bornes d'âge doivent être des entiers positifs ou nuls.")
+    if parameters.duplicated(["indicator", "sex", "age_min", "age_max"]).any():
+        raise ValueError("Paramètres de prévalence dupliqués pour un indicateur, sexe et âge.")
     if (parameters["age_min"] > parameters["age_max"]).any():
         raise ValueError("Chaque age_min doit être inférieur ou égal à age_max.")
     if ((parameters["baseline_rate"] < 0) | (parameters["baseline_rate"] > 1)).any():
@@ -111,6 +126,13 @@ def read_need_scenarios(path: Path) -> pd.DataFrame:
         raise ValueError(f"Colonnes manquantes dans need_scenarios.csv : {sorted(missing)}")
     for column in expected - {"need_scenario"}:
         scenarios[column] = pd.to_numeric(scenarios[column], errors="raise")
+    numeric = ["annual_relative_change", "min_multiplier", "max_multiplier"]
+    if not np.isfinite(scenarios[numeric].to_numpy(dtype=float)).all():
+        raise ValueError("Les paramètres des scénarios de besoin doivent être renseignés et finis.")
+    if (scenarios["annual_relative_change"] <= -1).any():
+        raise ValueError("La variation annuelle relative doit être strictement supérieure à -100 %.")
+    if scenarios["need_scenario"].isna().any() or scenarios["need_scenario"].duplicated().any():
+        raise ValueError("Chaque scénario de besoin doit avoir un nom renseigné et unique.")
     if (scenarios["min_multiplier"] <= 0).any() or (scenarios["max_multiplier"] <= 0).any():
         raise ValueError("Les multiplicateurs de scénario doivent être strictement positifs.")
     if (scenarios["min_multiplier"] > scenarios["max_multiplier"]).any():
@@ -130,8 +152,8 @@ def read_territorial_modifiers(path: Path | None) -> pd.DataFrame:
     modifiers["territorial_multiplier"] = pd.to_numeric(
         modifiers["territorial_multiplier"], errors="raise"
     )
-    if (modifiers["territorial_multiplier"] <= 0).any():
-        raise ValueError("Les multiplicateurs territoriaux doivent être strictement positifs.")
+    if not np.isfinite(modifiers["territorial_multiplier"]).all() or (modifiers["territorial_multiplier"] <= 0).any():
+        raise ValueError("Les multiplicateurs territoriaux doivent être renseignés, finis et strictement positifs.")
     if modifiers.duplicated(["department", "indicator"]).any():
         raise ValueError("territorial_modifiers.csv contient des doublons département × indicateur.")
     return modifiers
@@ -275,7 +297,10 @@ def summarize_projection(projection: pd.DataFrame) -> pd.DataFrame:
             population_at_risk=("population_at_risk", "sum"),
             persons_with_need=("persons_with_need", "sum"),
         )
-        .assign(prevalence=lambda data: data["persons_with_need"] / data["population_at_risk"])
+        # Convention identique à prepare_outcomes et au calcul par politiques :
+        # population nulle et besoin nul donnent une prévalence affichée à zéro.
+        .assign(prevalence=lambda data: data["persons_with_need"].div(
+            data["population_at_risk"].replace(0, np.nan)).fillna(0))
     )
 
 
