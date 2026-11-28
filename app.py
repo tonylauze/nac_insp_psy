@@ -2436,36 +2436,78 @@ def territory_card_html(row, parameters, label):
 </div>'''
 
 
-def map_card_html(row, parameters=None, label="", value_label="", value=np.nan):
-    """Fiche de survol : données calculées, jamais de valeur imputée si absente."""
-    def item(title, number):
-        return f'<div class="card-row"><span>{escape(title)}</span><strong>{escape(number)}</strong></div>'
-    name, year = str(row.get("nom", row.get("dep", ""))), str(int(row.annee))
+def map_card_html(row, parameters=None, label="", value_label="", value=np.nan, needs=None):
+    """Trois onglets, un diagnostic commun ; aucune imputation des données absentes."""
+    def metric(key, title, decimals=0, suffix="", signed=False, number=None):
+        number = format_quantity(row.get(key, np.nan), decimals, suffix, signed) if number is None else number
+        return (f'<div class="card-metric" data-metric="{escape(key)}"><span>{escape(title)}</span>'
+                f'<strong>{escape(number)}</strong></div>')
+    count, target = row.get("effectif", np.nan), row.get("psychiatres_cibles", np.nan)
+    status, tone, explanation = "Cible indisponible", "neutral", "Besoin, population et offre nécessaires pour la même année."
     if parameters is not None:
-        v = target_card_values(row, parameters)
-        rows = [("Population", v["population"]), ("Psychiatres", v["effectif"]),
-                ("Habitants / psychiatre", v["habitants_par_psy"]),
-                ("Personnes ciblées / psychiatre", v["personnes_par_psy"]),
-                (v["ecart_label"], v["ecart"]), ("Effectif cible estimé", v["fourchette"]),
-                ("Actes disponibles / nécessaires", v["ratio_actes"])]
-        status, tone = v["statut"], v["ton"]
-        note = (f"Besoin : {label}. Couverture cible : {parameters['couverture']:g} %. "
-                f"Fourchette : activité ±{v['marge']} %. Un ratio de 1 correspond à l’équilibre "
-                "des actes pour le besoin ciblé. Ce n’est pas une mesure de l’accès réel aux soins.")
+        if row.get("actes_necessaires", np.nan) == 0:
+            status, explanation = "Aucun besoin ciblé", "La cible est nulle avec les paramètres retenus."
+        elif np.isfinite(target) and np.isfinite(count):
+            gap = count - target
+            tolerance = 1e-9 * max(1, target)
+            status, tone = (("Au-dessus de la cible", "green") if gap > tolerance else
+                            ("Sous la cible", "red") if gap < -tolerance else ("À la cible", "neutral"))
+            explanation = (f"{format_quantity(gap, 1, signed=True)} psychiatres par rapport à la cible centrale "
+                           f"de {format_quantity(target, 1)}.")
+        else:
+            explanation = "Capacité mobilisable nulle : la cible ne peut pas être calculée."
+    supply = "".join([
+        metric("effectif", "Psychiatres", 1), metric("salaries", "Salariés", 1),
+        metric("liberaux", "Libéraux et mixtes", 1),
+        metric("part_salaries", "Part de salariés", number=format_quantity(row.get("part_salaries", np.nan) * 100, 1, " %")),
+        metric("actes_par_psychiatre", "Actes / psychiatre / an", 1), metric("actes_totaux", "Actes totaux / an"),
+        metric("actes_liberal", "Actes / libéral / an", 1), metric("actes_salarie", "Actes / salarié / an", 1),
+        metric("actes_disponibles", "Actes mobilisables / an")])
+    demand = metric("population_total", "Population totale")
+    if needs is not None and not needs.empty:
+        for need in needs.sort_values("indicator").to_dict("records"):
+            people, population = need.get("persons_with_need", np.nan), need.get("population_total", np.nan)
+            rate = 1000 * people / population if np.isfinite(population) and population > 0 else np.nan
+            demand += (f'<div class="need-heading">{escape(str(need.get("label", need["indicator"])))}</div>'
+                       + metric("persons_with_need", "Personnes avec besoin", number=format_quantity(people))
+                       + metric("need_per_1000", "Pour 1 000 habitants", number=format_quantity(rate, 1))
+                       + metric("population_at_risk", "Population du champ", number=format_quantity(need.get("population_at_risk", np.nan)))
+                       + metric("prevalence", "Prévalence dans ce champ", number=format_quantity(need.get("prevalence", np.nan) * 100, 1, " %")))
     else:
-        count, population = row.get("effectif", np.nan), row.get("population_total", np.nan)
-        ratio = population / count if np.isfinite(count) and count > 0 else np.nan
-        rows = [("Population", format_quantity(population)), ("Psychiatres", format_quantity(count, 1)),
-                ("Habitants / psychiatre", format_quantity(ratio)),
-                ("Effectif cible estimé", "Indisponible"), ("Manque / surplus", "Indisponible"),
-                ("Actes disponibles / nécessaires", "Indisponible")]
-        status, tone = "Rapprochement indisponible", "neutral"
-        note = "Données de besoin et de population nécessaires pour cette année et ce scénario. Aucun report depuis une autre année."
-    rows_html = "".join(item(title, number) for title, number in rows)
-    return (f'<section class="map-card"><header><strong>{escape(name)}</strong><span>{year}</span></header>'
-            f'{rows_html}<div class="card-status {tone}"><small>COUVERTURE THÉORIQUE</small><b>{escape(status)}</b></div>'
-            f'<p class="card-indicator">{escape(value_label)} : <b>{format_quantity(value, 1)}</b></p>'
-            f'<p class="card-note">{escape(note)}</p></section>')
+        demand += '<p class="tab-note">Détail des besoins indisponible pour cette année et ce scénario.</p>'
+    demand += ('<div class="need-heading">Besoin retenu pour la cible</div>'
+               + metric("persons_with_need", "Personnes avec besoin")
+               + metric("personnes_ciblees", "Personnes ciblées")
+               + metric("actes_necessaires", "Actes nécessaires / an"))
+    comparison = "".join([
+        metric("psychiatres_cibles", "Cible centrale", 1),
+        metric("target_band", "Fourchette cible", number=format_quantity(row.get("psychiatres_cibles_bas", np.nan), 1)
+               + " – " + format_quantity(row.get("psychiatres_cibles_haut", np.nan), 1)),
+        metric("solde_psychiatres", "Écart à la cible", 1, signed=True),
+        metric("psychiatres_manquants", "Psychiatres manquants", 1), metric("psychiatres_surplus", "Psychiatres en surplus", 1),
+        metric("solde_actes", "Solde d’actes / an", signed=True),
+        metric("solde_actes_habitant", "Solde d’actes / habitant / an", 2, signed=True),
+        metric("couverture_actes_pct", "Couverture des actes", 1, " %"),
+        metric("habitants_par_psychiatre", "Habitants / psychiatre"),
+        metric("personnes_ciblees_par_psychiatre", "Personnes ciblées / psychiatre"),
+        metric("capacite_mobilisable_par_psychiatre", "Actes mobilisables / psychiatre", 1)])
+    tabs = "".join(f'<button type="button" role="tab" id="tab-{key}" aria-controls="panel-{key}" '
+                   f'aria-selected="{str(i == 0).lower()}" tabindex="{0 if i == 0 else -1}" data-tab="{key}">{title}</button>'
+                   for i, (key, title) in enumerate((("supply", "Offre"), ("demand", "Demande"), ("match", "Offre-demande"))))
+    panels = "".join(f'<div role="tabpanel" id="panel-{key}" aria-labelledby="tab-{key}" '
+                     f'{"hidden" if key != "supply" else ""}><div class="metric-grid">{body}</div></div>'
+                     for key, body in (("supply", supply), ("demand", demand), ("match", comparison)))
+    settings = (f"Couverture cible : {parameters['couverture']:g} % du besoin ; {parameters['actes_par_besoin']:g} actes/personne/an ; "
+                f"{parameters['part_offre']:g} % de l’offre mobilisable. Fourchette : activité ±{parameters.get('marge_activite', 10):g} %."
+                if parameters is not None else "Aucune donnée d’une autre année n’est substituée.")
+    return (f'<section class="map-card"><header><div><small>DÉPARTEMENT {escape(str(row.get("dep", "")))}</small>'
+            f'<h2>{escape(str(row.get("nom", "")))}</h2></div><span class="year-badge">{int(row.annee)}</span></header>'
+            f'<div class="card-status {tone}"><b>{escape(status)}</b><span>{escape(explanation)}</span></div>'
+            f'<p class="target-context">Cible pour : {escape(label or "besoin non disponible")}</p>'
+            f'<nav role="tablist" aria-label="Indicateurs du département">{tabs}</nav>'
+            f'<div class="card-body">{panels}<p class="card-note">{escape(settings)} '
+            'Estimation théorique, pas une mesure de l’accès réel aux soins. Les besoins ne sont pas à additionner entre eux.</p></div>'
+            f'<footer>Couleur de la carte : {escape(value_label)}<strong>{format_quantity(value, 2)}</strong></footer></section>')
 
 
 def target_evolution_figure(detail, department):
@@ -2915,9 +2957,18 @@ def render_map_tab(app, df, demand, demand_error, matching, matching_error, scen
     selected["annee"] = year
     supply = st.session_state.psy_projection["panel"]
     supply = supply[(supply.scenario == drees) & (supply.annee == year)]
-    selected = selected.merge(supply[["dep", "effectif"]], on="dep", how="left", validate="one_to_one")
+    supply_columns = ["dep"] + [key for key in INDICATORS if key in supply]
+    selected = selected.merge(supply[supply_columns], on="dep", how="left", validate="one_to_one")
+    needs_by_dep = {}
+    if demand is not None:
+        all_needs = demand_map_frame(demand, context["baseline"], scenario["rapprochement"])
+        all_needs = all_needs[all_needs.annee == year]
+        needs_by_dep = dict(tuple(all_needs.groupby("dep")))
+        if "population_total" in all_needs:
+            populations = all_needs.groupby("dep").population_total.first()
+            selected["population_total"] = selected.dep.map(populations)
     selected["fiche_carte"] = selected.apply(
-        lambda row: map_card_html(row, value_label=value_label, value=row.valeur), axis=1)
+        lambda row: map_card_html(row, value_label=value_label, value=row.valeur, needs=needs_by_dep.get(row.dep)), axis=1)
     map_matching = matching
     if family == FAMILY_DEMAND and indicator is not None and demand is not None and indicator[0] != scenario["rapprochement"].get("need_indicator"):
         try:
@@ -2938,7 +2989,7 @@ def render_map_tab(app, df, demand, demand_error, matching, matching_error, scen
             selected = selected.merge(card_detail[["dep", "info_bulle"]], on="dep", how="left", validate="one_to_one")
             values = selected.set_index("dep").valeur
             cards = card_detail.apply(lambda row: map_card_html(row, map_matching["parameters"], label,
-                                      value_label, values.get(row.dep, np.nan)), axis=1)
+                                      value_label, values.get(row.dep, np.nan), needs=needs_by_dep.get(row.dep)), axis=1)
             cards.index = card_detail.dep
             selected["fiche_carte"] = selected.dep.map(cards).fillna(selected.fiche_carte)
     with map_area:
@@ -2994,12 +3045,38 @@ def map_color_scale(scale_values, indicator):
         vmin, vmax = (0.0, 100.0) if is_share else scale_values.quantile([0.02, 0.98]) if not scale_values.empty else (0.0, 1.0)
     if vmin == vmax:
         vmax = vmin + 1
-    signed_scale = [[0, "#ad536f"], [.5, "#f6f4f3"], [1, "#5c9d77"]]
+    signed_scale = [[0, "#b83a45"], [.5, "#f5f5f1"], [1, "#23835c"]]
     colorscale = signed_scale if is_balance else px.colors.sequential.Blues[1:]
     if indicator == NEED_COVERAGE:
         midpoint = 100 / vmax
-        colorscale = [[0, "#ad536f"], [midpoint, "#f6f4f3"], [min(1.0, midpoint + .12), "#81b28f"], [1, "#39754d"]]
+        colorscale = [[0, "#b83a45"], [midpoint, "#f5f5f1"], [min(1.0, midpoint + .12), "#81b28f"], [1, "#23754f"]]
     return float(vmin), float(vmax), colorscale
+
+
+def map_legend_details(scale_values, indicator):
+    """Sens et normalisation de la couleur, communs aux deux vues."""
+    vmin, vmax, _ = map_color_scale(scale_values, indicator)
+    if indicator in (ACTS_BALANCE, PSY_BALANCE):
+        labels, midpoint = ("Rouge : déficit", "0 : équilibre", "Vert : surplus"), 0.0
+        method = "Échelle symétrique autour de 0 : la borne est le 98e percentile des valeurs absolues (au moins 0,001)."
+        meaning = "Un solde négatif signifie une offre inférieure au besoin ciblé ; un solde positif signifie un surplus théorique."
+    elif indicator == NEED_COVERAGE:
+        labels, midpoint = ("Rouge : < 100 %", "100 % : cible", "Vert : > 100 %"), 100.0
+        method = "Minimum 0 % ; maximum égal au plus grand de 200 % et du 98e percentile. Le blanc est placé exactement à 100 %."
+        meaning = "Couverture = 100 × actes mobilisables / actes nécessaires. Au-delà de 100 %, l’offre dépasse le besoin ciblé."
+    else:
+        labels, midpoint = ("Clair : valeur faible", "", "Foncé : valeur élevée"), None
+        method = ("Bornes fixes : 0 et 100 %." if indicator == SALARIED_SHARE else
+                  "Bornes : 2e et 98e percentiles des valeurs disponibles. Si elles sont égales, la borne haute est augmentée de 1.")
+        meaning = "Le bleu indique uniquement le niveau de l’indicateur. Une valeur élevée ne signifie pas automatiquement que le besoin est couvert. Le bandeau de la fiche compare séparément l’offre à la cible."
+    detail = (meaning + " " + method + " La position dans le dégradé est (valeur − minimum) / (maximum − minimum), "
+              "bornée entre 0 et 1. Les valeurs hors bornes gardent leur valeur réelle dans la fiche mais prennent la couleur extrême. "
+              "Les bornes utilisent toutes les années et projections DREES disponibles de l’indicateur dans le scénario actif "
+              "(pour la demande : les scénarios Insee et de besoin choisis). Elles restent fixes lors d’un changement d’année. "
+              "Gris : donnée indisponible, jamais zéro. La carte interactive utilise 101 nuances et une opacité de 66 % sur le fond ; "
+              "le survol renforce l’opacité à 78 %. Le vert ne mesure pas la qualité ni l’accès réel aux soins.")
+    return {"labels": labels, "midpoint": midpoint, "position": None if midpoint is None else (midpoint-vmin)/(vmax-vmin),
+            "explanation": detail}
 
 
 def interactive_map_html(selected, scale_values, value_label, indicator, gj):
@@ -3019,7 +3096,7 @@ def interactive_map_html(selected, scale_values, value_label, indicator, gj):
             "code": code, "name": str(row.nom), "color": color, "card": row.fiche_carte}})
     payload = {"geojson": {"type": "FeatureCollection", "features": features},
                "legend": value_label, "min": format_quantity(vmin, 1), "max": format_quantity(vmax, 1),
-               "colors": palette, "drom": DROM}
+               "colors": palette, "drom": DROM, "semantics": map_legend_details(scale_values, indicator)}
     # Le JSON est placé dans un élément script : empêcher toute fermeture par une donnée.
     data = json.dumps(payload, ensure_ascii=False, allow_nan=False).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
     html = r'''<!doctype html><html lang="fr"><head><meta charset="utf-8">
@@ -3033,22 +3110,33 @@ button,select{font:inherit;background:white;color:#273442;border:1px solid #cbd5
 button:hover,select:hover{background:#eef4f8}button:focus-visible,select:focus-visible{outline:3px solid #3982b5;outline-offset:1px}
 #territory{min-width:0;max-width:240px;flex:1}#map{height:612px;background:#e9eef1;z-index:0}
 #hint{position:absolute;left:52px;top:70px;z-index:700;background:#ffffffed;border-radius:7px;padding:8px 10px;font-size:12px;pointer-events:none;max-width:50%}
-#detail{display:none;position:absolute;right:12px;top:70px;width:338px;max-height:510px;overflow:auto;z-index:900;background:white;border:1px solid #dae0e5;border-radius:15px;box-shadow:0 8px 30px #10253630;pointer-events:none}
-#detail.pinned{pointer-events:auto}#close{display:none;position:absolute;right:7px;top:7px;padding:1px 6px;border:0;font-size:20px;background:transparent}
-#detail.pinned #close{display:block}.map-card{padding:19px 20px 13px}.map-card header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 16px 10px 0}
-.map-card header strong{font-size:22px}.map-card header span{font-size:15px;color:#71808e}
-.card-row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid #edf0f2;align-items:baseline;font-size:13px}
-.card-row span{color:#647180}.card-row strong{text-align:right;font-size:15px;white-space:nowrap}
-.card-status{margin-top:13px;border-left:4px solid;padding:10px 12px;border-radius:0 7px 7px 0}
-.card-status small{display:block;letter-spacing:.04em;font-size:10px;color:#67727b}.card-status b{display:block;margin-top:4px;font-size:15px}
-.green{background:#edf5ef;border-color:#50895e;color:#397447}.red{background:#fbf0f3;border-color:#b93855;color:#a82d4a}
-.amber{background:#faf5e9;border-color:#b18a34;color:#876421}.neutral{background:#f2f4f6;border-color:#82909b;color:#5b6770}
-.card-note{font-size:10px;line-height:1.45;color:#73808b;margin-bottom:0}.card-indicator{font-size:11px;color:#526272;margin:10px 0 0}
-.legend{width:245px;background:#fffffff2;border-radius:8px;padding:10px 12px;box-shadow:0 1px 5px #0002;font:11px Arial,sans-serif}
-.legend-title{font-weight:bold;margin-bottom:6px}.legend-bar{height:9px;border-radius:3px}.legend-labels{display:flex;justify-content:space-between;margin-top:3px}
-.legend-note{margin-top:5px;color:#687783}#error{display:none;padding:25px;background:#fff4e9}
+#detail{display:none;position:absolute;right:12px;top:70px;width:395px;max-height:558px;z-index:900;background:white;border:1px solid #dce3e8;border-radius:15px;box-shadow:0 8px 35px #10253630;pointer-events:auto;overflow:hidden}
+#close{position:absolute;right:8px;top:8px;padding:0 5px;border:0;font-size:21px;background:transparent;z-index:1}
+.map-card{display:flex;flex-direction:column;max-height:inherit}.map-card>header,.map-card>nav,.map-card>footer,.card-status,.target-context{flex-shrink:0}
+.map-card header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:18px 38px 14px 18px;background:#f1f5f8}
+.map-card header small{color:#607180;font-size:10px;letter-spacing:.1em}.map-card h2{font-size:22px;line-height:1.15;margin:4px 0 0}
+.year-badge{font-size:12px;background:#fff;padding:6px 9px;border-radius:20px;color:#516576}
+.card-status{margin:12px 14px 0;border:1px solid;border-radius:9px;padding:10px 12px}.card-status b{display:block;font-size:16px}
+.card-status span{display:block;font-size:11px;line-height:1.45;margin-top:4px}.green{background:#eaf6ef;border-color:#95c8ae;color:#186041}.red{background:#fdf0f0;border-color:#e6b0b5;color:#a72e39}.neutral{background:#f3f5f7;border-color:#d3dae0;color:#556573}
+.target-context{margin:8px 15px 10px;font-size:10px;color:#677786;line-height:1.3}
+.map-card nav{display:flex;padding:0 14px;gap:4px;border-bottom:1px solid #dce3e8}
+.map-card [role=tab]{flex:1;border:0;border-radius:6px 6px 0 0;font-size:12px;padding:10px 5px;color:#627280}
+.map-card [aria-selected=true]{background:#163e52;color:white;font-weight:bold}
+.card-body{max-height:240px;min-height:0;flex:1 1 auto;overflow-y:auto;padding:12px 14px;overscroll-behavior:contain}
+.metric-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.card-metric{border:1px solid #e6ebef;border-radius:8px;padding:10px;background:#fbfcfd;min-width:0}
+.card-metric span{display:block;font-size:10px;line-height:1.3;color:#637586}.card-metric strong{display:block;font-size:17px;margin-top:5px;overflow-wrap:anywhere}
+.need-heading{grid-column:1/-1;font-size:12px;font-weight:bold;color:#244d62;padding:7px 0 2px}.card-note,.tab-note{font-size:10px;line-height:1.5;color:#6a7985}.tab-note{grid-column:1/-1}
+.map-card footer{padding:9px 14px;background:#f1f5f8;font-size:10px;color:#536675;display:flex;gap:12px;justify-content:space-between}.map-card footer strong{white-space:nowrap;color:#253b4b;font-size:12px}
+.legend{width:310px;background:#fffffff5;border:1px solid #e2e7eb;border-radius:10px;padding:11px 12px;box-shadow:0 2px 12px #16354718;font:11px Arial,sans-serif}
+.legend-title{font-weight:bold;padding-right:25px;margin-bottom:9px;font-size:12px}.legend-info{position:absolute;right:8px;top:7px;border-radius:50%;font-weight:bold;width:23px;height:23px;padding:0;color:#36586b}
+.legend-bar{height:10px;border-radius:3px;position:relative}.legend-mid{position:absolute;top:-2px;width:2px;height:14px;background:#344b59}
+.legend-labels{display:flex;justify-content:space-between;margin-top:4px}.legend-meaning{display:flex;justify-content:space-between;gap:8px;margin-top:8px;font-size:10px;line-height:1.4}
+.legend-note{margin-top:7px;color:#687783;font-size:10px}.legend-explanation{font-size:11px;line-height:1.5;margin:10px 0 0;max-height:210px;overflow:auto;border-top:1px solid #dbe3e9;padding-top:8px}
+#error{display:none;padding:25px;background:#fff4e9}
 @media(max-width:600px){#toolbar{gap:4px;padding:8px 6px;font-size:11px}#toolbar button{padding:8px 5px}#territory{max-width:130px}
-#detail{top:auto;bottom:30px;right:6px;width:min(315px,calc(100% - 12px));max-height:340px}#hint{font-size:10px;left:50px;max-width:75%}.legend{width:180px}#detail.pinned{max-height:480px}}
+#detail{top:68px;right:6px;width:calc(100% - 12px);max-height:485px}.map-card header{padding:12px 36px 10px 14px}.map-card h2{font-size:19px}
+.card-body{max-height:205px}.card-status{margin-top:8px;padding:8px 10px}.card-status b{font-size:14px}#hint{font-size:10px;left:50px;max-width:75%}
+.legend{width:260px}.legend-explanation{max-height:130px}.legend-meaning{font-size:9px}.card-metric{padding:8px}.card-metric strong{font-size:15px}}
 </style></head><body><div id="shell">
 <div id="toolbar"><button id="reset" title="Revenir à la métropole">Métropole</button>
 <select id="overseas" aria-label="Aller dans un département d’outre-mer"><option value="">Outre-mer</option></select>
@@ -3070,20 +3158,35 @@ L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{
  attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',maxZoom:19}).addTo(map);
 L.control.scale({imperial:false,position:'bottomright'}).addTo(map);
 const detail=document.getElementById('detail'), content=document.getElementById('content'), hint=document.getElementById('hint');
-let pinned=null;const layers={};
+let pinned=null, activeLayer=null, hideTimer=null, activeTab='supply';const layers={};
 const baseStyle=f=>({color:'#607382',weight:1,fillColor:f.properties.color,fillOpacity:.66});
-function show(layer,pin=false){
- if(pinned && !pin)return;
- if(pin && pinned)geo.resetStyle(pinned);
- if(pin)pinned=layer;
- detail.classList.toggle('pinned',!!pinned);content.innerHTML=layer.feature.properties.card;
- detail.style.display='block';hint.style.display='none';layer.setStyle({weight:3,color:'#b17a32',fillOpacity:.78});layer.bringToFront();
+function selectTab(key,focus=false){
+ activeTab=key;
+ content.querySelectorAll('[role=tab]').forEach(tab=>{const on=tab.dataset.tab===key;tab.setAttribute('aria-selected',String(on));tab.tabIndex=on?0:-1;if(on&&focus)tab.focus();});
+ content.querySelectorAll('[role=tabpanel]').forEach(panel=>panel.hidden=panel.id!=='panel-'+key);
+ content.querySelector('.card-body').scrollTop=0;
 }
-function close(){if(pinned)geo.resetStyle(pinned);pinned=null;detail.style.display='none';detail.classList.remove('pinned');hint.style.display='block';}
+function show(layer,pin=false){
+ clearTimeout(hideTimer);if(pinned && !pin)return;
+ if(activeLayer && activeLayer!==layer)geo.resetStyle(activeLayer);
+ if(pin)pinned=layer;activeLayer=layer;
+ detail.classList.toggle('pinned',!!pinned);content.innerHTML=layer.feature.properties.card;selectTab(activeTab);
+ detail.style.display='block';hint.style.display='none';layer.setStyle({weight:3,color:'#163e52',fillOpacity:.78});layer.bringToFront();
+}
+function close(){clearTimeout(hideTimer);if(activeLayer)geo.resetStyle(activeLayer);pinned=null;activeLayer=null;detail.style.display='none';detail.classList.remove('pinned');hint.style.display='block';}
+function scheduleHide(){clearTimeout(hideTimer);if(!pinned)hideTimer=setTimeout(()=>{if(!detail.matches(':hover')&&!detail.contains(document.activeElement))close();},450);}
+// Le délai permet de passer du polygone à la fiche et d'utiliser ses onglets.
+detail.addEventListener('mouseenter',()=>clearTimeout(hideTimer));detail.addEventListener('mouseleave',scheduleHide);
+detail.addEventListener('focusin',()=>clearTimeout(hideTimer));detail.addEventListener('focusout',scheduleHide);
+content.addEventListener('click',e=>{const tab=e.target.closest('[role=tab]');if(tab)selectTab(tab.dataset.tab);});
+content.addEventListener('keydown',e=>{const tab=e.target.closest('[role=tab]');if(!tab)return;const keys=['supply','demand','match'];let index=keys.indexOf(activeTab);
+ if(e.key==='ArrowRight')index=(index+1)%3;else if(e.key==='ArrowLeft')index=(index+2)%3;else if(e.key==='Home')index=0;else if(e.key==='End')index=2;else return;
+ e.preventDefault();selectTab(keys[index],true);});
+L.DomEvent.disableClickPropagation(detail);L.DomEvent.disableScrollPropagation(detail);
 const geo=L.geoJSON(data.geojson,{style:baseStyle,onEachFeature:(f,layer)=>{
  layers[f.properties.code]=layer;
  layer.on('add',()=>{const el=layer.getElement();if(el){el.setAttribute('data-department',f.properties.code);el.setAttribute('aria-label',f.properties.name);}});
- layer.on({mouseover:()=>show(layer),mouseout:()=>{if(layer!==pinned)geo.resetStyle(layer);if(!pinned){detail.style.display='none';hint.style.display='block';}},
+ layer.on({mouseover:()=>show(layer),mouseout:scheduleHide,
  click:e=>{L.DomEvent.stopPropagation(e);show(layer,true);}});
 }}).addTo(map);
 document.getElementById('close').onclick=close;map.on('click',close);
@@ -3104,8 +3207,14 @@ const legend=L.control({position:'bottomleft'});legend.onAdd=()=>{
  const title=L.DomUtil.create('div','legend-title',div);title.textContent=data.legend;
  const bar=L.DomUtil.create('div','legend-bar',div);bar.style.background='linear-gradient(to right,'+data.colors.join(',')+')';
  const labels=L.DomUtil.create('div','legend-labels',div);const low=L.DomUtil.create('span','',labels),high=L.DomUtil.create('span','',labels);low.textContent=data.min;high.textContent=data.max;
- const note=L.DomUtil.create('div','legend-note',div);note.textContent='Gris : donnée indisponible · Échelle bornée';
- L.DomEvent.disableClickPropagation(div);return div;};legend.addTo(map);
+ const meanings=L.DomUtil.create('div','legend-meaning',div);
+ data.semantics.labels.filter(Boolean).forEach(label=>{const span=L.DomUtil.create('span','',meanings);span.textContent=label;});
+ if(data.semantics.position!==null){const mark=L.DomUtil.create('span','legend-mid',bar);mark.style.left=(100*data.semantics.position)+'%';}
+ const note=L.DomUtil.create('div','legend-note',div);note.textContent='Gris : indisponible · Bornes communes à toutes les années';
+ const info=L.DomUtil.create('button','legend-info',div);info.type='button';info.textContent='i';info.setAttribute('aria-label','Comprendre la légende et le calcul des couleurs');info.setAttribute('aria-expanded','false');info.setAttribute('aria-controls','legend-explanation');
+ const explanation=L.DomUtil.create('p','legend-explanation',div);explanation.id='legend-explanation';explanation.hidden=true;explanation.textContent=data.semantics.explanation;
+ info.onclick=()=>{explanation.hidden=!explanation.hidden;info.setAttribute('aria-expanded',String(!explanation.hidden));};
+ L.DomEvent.disableClickPropagation(div);L.DomEvent.disableScrollPropagation(div);return div;};legend.addTo(map);
 const key='nac-psy-map-view-v1';let restored=false;
 try{const view=JSON.parse(sessionStorage.getItem(key));if(view && Number.isFinite(view.lat) && Number.isFinite(view.lng) && Number.isFinite(view.zoom)){
  map.setView([view.lat,view.lng],Math.max(2,Math.min(15,view.zoom)));restored=true;}}catch(e){}
@@ -3182,8 +3291,11 @@ def render_choropleth(selected, scale_values, value_label, indicator):
         else:
             from streamlit.components.v1 import html as component_html
             component_html(content, height=680, scrolling=False)
-        st.caption("Zoom : molette, pincement tactile ou boutons +/−. Déplacement : glisser la carte. Recherche et raccourcis outre-mer en haut. Un clic garde la fiche ouverte ; × ou Échap la ferme.")
+        st.caption("Les trois onglets de la fiche sont accessibles au survol. Zoom : molette, pincement tactile ou boutons +/−. Déplacement : glisser la carte. Recherche et raccourcis outre-mer en haut. Un clic garde la fiche ouverte ; × ou Échap la ferme.")
     else:
+        with st.popover("ⓘ Comprendre les couleurs"):
+            st.write(map_legend_details(scale_values, indicator)["explanation"])
+        st.caption("Les fiches à trois onglets sont disponibles dans la carte interactive.")
         fig = france_figure(selected, scale_values, value_label, indicator, gj)
         st.plotly_chart(fig, width="stretch", height=640,
                         config={"scrollZoom": True, "displayModeBar": True, "displaylogo": False})
