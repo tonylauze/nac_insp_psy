@@ -2397,6 +2397,8 @@ def target_card_values(row, parameters):
             "personnes_ciblees": format_quantity(row.personnes_ciblees), "cible": format_quantity(row.psychiatres_cibles, 1),
             "fourchette": band, "ecart_label": gap_label, "ecart": gap,
             "couverture": format_quantity(row.couverture_actes_pct, 1, " %"), "statut": status, "ton": tone,
+            "ratio_actes": format_quantity(row.couverture_actes_pct / 100, 2, " ×"),
+            "personnes_par_psy": format_quantity(row.personnes_ciblees_par_psychiatre),
             "capacite": format_quantity(row.capacite_mobilisable_par_psychiatre, 1),
             "besoin": format_quantity(row.actes_necessaires), "marge": format_quantity(margin),
             "mix_repli": bool(row.mix_cible_repli)}
@@ -2432,6 +2434,38 @@ def territory_card_html(row, parameters, label):
 <div class="psy-card-status psy-card-{v['ton']}"><small>COUVERTURE THÉORIQUE</small><strong>{escape(v['statut'])}</strong></div>
 <div class="psy-card-footnote">Fourchette : activité par psychiatre ±{v['marge']} %. Hypothèse de sensibilité, pas un intervalle de confiance. {escape(note)}</div>
 </div>'''
+
+
+def map_card_html(row, parameters=None, label="", value_label="", value=np.nan):
+    """Fiche de survol : données calculées, jamais de valeur imputée si absente."""
+    def item(title, number):
+        return f'<div class="card-row"><span>{escape(title)}</span><strong>{escape(number)}</strong></div>'
+    name, year = str(row.get("nom", row.get("dep", ""))), str(int(row.annee))
+    if parameters is not None:
+        v = target_card_values(row, parameters)
+        rows = [("Population", v["population"]), ("Psychiatres", v["effectif"]),
+                ("Habitants / psychiatre", v["habitants_par_psy"]),
+                ("Personnes ciblées / psychiatre", v["personnes_par_psy"]),
+                (v["ecart_label"], v["ecart"]), ("Effectif cible estimé", v["fourchette"]),
+                ("Actes disponibles / nécessaires", v["ratio_actes"])]
+        status, tone = v["statut"], v["ton"]
+        note = (f"Besoin : {label}. Couverture cible : {parameters['couverture']:g} %. "
+                f"Fourchette : activité ±{v['marge']} %. Un ratio de 1 correspond à l’équilibre "
+                "des actes pour le besoin ciblé. Ce n’est pas une mesure de l’accès réel aux soins.")
+    else:
+        count, population = row.get("effectif", np.nan), row.get("population_total", np.nan)
+        ratio = population / count if np.isfinite(count) and count > 0 else np.nan
+        rows = [("Population", format_quantity(population)), ("Psychiatres", format_quantity(count, 1)),
+                ("Habitants / psychiatre", format_quantity(ratio)),
+                ("Effectif cible estimé", "Indisponible"), ("Manque / surplus", "Indisponible"),
+                ("Actes disponibles / nécessaires", "Indisponible")]
+        status, tone = "Rapprochement indisponible", "neutral"
+        note = "Données de besoin et de population nécessaires pour cette année et ce scénario. Aucun report depuis une autre année."
+    rows_html = "".join(item(title, number) for title, number in rows)
+    return (f'<section class="map-card"><header><strong>{escape(name)}</strong><span>{year}</span></header>'
+            f'{rows_html}<div class="card-status {tone}"><small>COUVERTURE THÉORIQUE</small><b>{escape(status)}</b></div>'
+            f'<p class="card-indicator">{escape(value_label)} : <b>{format_quantity(value, 1)}</b></p>'
+            f'<p class="card-note">{escape(note)}</p></section>')
 
 
 def target_evolution_figure(detail, department):
@@ -2598,9 +2632,7 @@ PAGE_STYLE = f"""<style>
 [data-testid="stSidebarNavLink"] p {{font-size: 1.02rem; font-weight: 600;}}
 [data-testid="stSidebarNavLink"][aria-current="page"] {{background: #c53948; border-color: #c53948;}}
 [data-testid="stSidebarNavLink"][aria-current="page"] * {{color: #ffffff !important;}}
-.st-key-map_box {{height: calc({MAP_SCALE} * (100vh - {MAP_RESERVED_HEIGHT}px)) !important;
-                  min-height: {round(MAP_SCALE * MAP_MIN_HEIGHT)}px;
-                  flex: 0 0 auto !important;}}
+.st-key-map_box {{min-height: {round(MAP_SCALE * MAP_MIN_HEIGHT)}px; flex: 0 0 auto !important;}}
 
 .psy-territory-card {{max-width: 520px; background: #fff; color: #25282c; border: 1px solid #e0e3e6;
  border-radius: 18px; padding: 24px 26px; box-shadow: 0 10px 30px rgba(20,34,46,.09); margin: 8px 0 18px;}}
@@ -2878,7 +2910,14 @@ def render_map_tab(app, df, demand, demand_error, matching, matching_error, scen
         selected = rows[(rows.scenario == drees) & (rows.annee == year)]
         scale_values = rows.valeur
     selected = selected[["dep", "valeur"]].copy() if not selected.empty else pd.DataFrame(columns=["dep", "valeur"])
+    selected = pd.DataFrame({"dep": sorted(names)}).merge(selected, on="dep", how="left", validate="one_to_one")
     selected["nom"] = selected.dep.map(names)
+    selected["annee"] = year
+    supply = st.session_state.psy_projection["panel"]
+    supply = supply[(supply.scenario == drees) & (supply.annee == year)]
+    selected = selected.merge(supply[["dep", "effectif"]], on="dep", how="left", validate="one_to_one")
+    selected["fiche_carte"] = selected.apply(
+        lambda row: map_card_html(row, value_label=value_label, value=row.valeur), axis=1)
     map_matching = matching
     if family == FAMILY_DEMAND and indicator is not None and demand is not None and indicator[0] != scenario["rapprochement"].get("need_indicator"):
         try:
@@ -2897,10 +2936,15 @@ def render_map_tab(app, df, demand, demand_error, matching, matching_error, scen
             label = labels.get(map_matching["parameters"]["need_indicator"], map_matching["parameters"]["need_indicator"])
             card_detail["info_bulle"] = card_detail.apply(lambda row: territory_hover(row, map_matching["parameters"], label), axis=1)
             selected = selected.merge(card_detail[["dep", "info_bulle"]], on="dep", how="left", validate="one_to_one")
+            values = selected.set_index("dep").valeur
+            cards = card_detail.apply(lambda row: map_card_html(row, map_matching["parameters"], label,
+                                      value_label, values.get(row.dep, np.nan)), axis=1)
+            cards.index = card_detail.dep
+            selected["fiche_carte"] = selected.dep.map(cards).fillna(selected.fiche_carte)
     with map_area:
         if family == FAMILY_DEMAND and demand is None:
             st.warning(f"Demande de soins indisponible : {demand_error}" if demand_error else "Demande de soins indisponible.")
-        elif family == FAMILY_MATCH and selected.empty:
+        elif family == FAMILY_MATCH and selected.valeur.isna().all():
             st.warning(matching_error or "Indicateur disponible uniquement sur la période commune à l'offre, à la demande et à la population totale.")
         render_choropleth(selected, scale_values, value_label, indicator)
     with st.expander(f"Valeurs par département en {year}"):
@@ -2937,8 +2981,8 @@ def render_map_tab(app, df, demand, demand_error, matching, matching_error, scen
     return drees, year
 
 
-def france_figure(selected, scale_values, value_label, indicator, gj):
-    """Métropole et cinq encarts DROM, même échelle de couleur partout."""
+def map_color_scale(scale_values, indicator):
+    """Une échelle commune aux deux cartes, stable entre années et territoires."""
     is_share, is_balance = indicator == SALARIED_SHARE, indicator in (ACTS_BALANCE, PSY_BALANCE)
     scale_values = pd.to_numeric(scale_values, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
     if is_balance:
@@ -2950,12 +2994,132 @@ def france_figure(selected, scale_values, value_label, indicator, gj):
         vmin, vmax = (0.0, 100.0) if is_share else scale_values.quantile([0.02, 0.98]) if not scale_values.empty else (0.0, 1.0)
     if vmin == vmax:
         vmax = vmin + 1
-    unit = " %" if is_share or indicator == NEED_COVERAGE else ""
     signed_scale = [[0, "#ad536f"], [.5, "#f6f4f3"], [1, "#5c9d77"]]
     colorscale = signed_scale if is_balance else px.colors.sequential.Blues[1:]
     if indicator == NEED_COVERAGE:
         midpoint = 100 / vmax
         colorscale = [[0, "#ad536f"], [midpoint, "#f6f4f3"], [min(1.0, midpoint + .12), "#81b28f"], [1, "#39754d"]]
+    return float(vmin), float(vmax), colorscale
+
+
+def interactive_map_html(selected, scale_values, value_label, indicator, gj):
+    """Carte Leaflet autonome : aucun paquet Python supplémentaire requis."""
+    vmin, vmax, colorscale = map_color_scale(scale_values, indicator)
+    palette = px.colors.sample_colorscale(colorscale, np.linspace(0, 1, 101).tolist())
+    lookup = selected.set_index("dep")
+    features = []
+    for feature in gj["features"]:
+        code = feature["properties"]["code"]
+        if code not in lookup.index:
+            continue
+        row = lookup.loc[code]
+        value = float(row.valeur)
+        color = palette[int(np.clip((value - vmin) / (vmax - vmin), 0, 1) * 100)] if np.isfinite(value) else "#d6dade"
+        features.append({"type": "Feature", "geometry": feature["geometry"], "properties": {
+            "code": code, "name": str(row.nom), "color": color, "card": row.fiche_carte}})
+    payload = {"geojson": {"type": "FeatureCollection", "features": features},
+               "legend": value_label, "min": format_quantity(vmin, 1), "max": format_quantity(vmax, 1),
+               "colors": palette, "drom": DROM}
+    # Le JSON est placé dans un élément script : empêcher toute fermeture par une donnée.
+    data = json.dumps(payload, ensure_ascii=False, allow_nan=False).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    html = r'''<!doctype html><html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+*{box-sizing:border-box}body{margin:0;font:14px Arial,sans-serif;color:#273442;background:white}
+#shell{height:670px;position:relative;border:1px solid #dde3e8;border-radius:14px;overflow:hidden}
+#toolbar{height:58px;display:flex;align-items:center;gap:7px;padding:9px 12px;border-bottom:1px solid #e4e8ec;background:#fff}
+button,select{font:inherit;background:white;color:#273442;border:1px solid #cbd5df;border-radius:7px;padding:8px;cursor:pointer}
+button:hover,select:hover{background:#eef4f8}button:focus-visible,select:focus-visible{outline:3px solid #3982b5;outline-offset:1px}
+#territory{min-width:0;max-width:240px;flex:1}#map{height:612px;background:#e9eef1;z-index:0}
+#hint{position:absolute;left:52px;top:70px;z-index:700;background:#ffffffed;border-radius:7px;padding:8px 10px;font-size:12px;pointer-events:none;max-width:50%}
+#detail{display:none;position:absolute;right:12px;top:70px;width:338px;max-height:510px;overflow:auto;z-index:900;background:white;border:1px solid #dae0e5;border-radius:15px;box-shadow:0 8px 30px #10253630;pointer-events:none}
+#detail.pinned{pointer-events:auto}#close{display:none;position:absolute;right:7px;top:7px;padding:1px 6px;border:0;font-size:20px;background:transparent}
+#detail.pinned #close{display:block}.map-card{padding:19px 20px 13px}.map-card header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 16px 10px 0}
+.map-card header strong{font-size:22px}.map-card header span{font-size:15px;color:#71808e}
+.card-row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid #edf0f2;align-items:baseline;font-size:13px}
+.card-row span{color:#647180}.card-row strong{text-align:right;font-size:15px;white-space:nowrap}
+.card-status{margin-top:13px;border-left:4px solid;padding:10px 12px;border-radius:0 7px 7px 0}
+.card-status small{display:block;letter-spacing:.04em;font-size:10px;color:#67727b}.card-status b{display:block;margin-top:4px;font-size:15px}
+.green{background:#edf5ef;border-color:#50895e;color:#397447}.red{background:#fbf0f3;border-color:#b93855;color:#a82d4a}
+.amber{background:#faf5e9;border-color:#b18a34;color:#876421}.neutral{background:#f2f4f6;border-color:#82909b;color:#5b6770}
+.card-note{font-size:10px;line-height:1.45;color:#73808b;margin-bottom:0}.card-indicator{font-size:11px;color:#526272;margin:10px 0 0}
+.legend{width:245px;background:#fffffff2;border-radius:8px;padding:10px 12px;box-shadow:0 1px 5px #0002;font:11px Arial,sans-serif}
+.legend-title{font-weight:bold;margin-bottom:6px}.legend-bar{height:9px;border-radius:3px}.legend-labels{display:flex;justify-content:space-between;margin-top:3px}
+.legend-note{margin-top:5px;color:#687783}#error{display:none;padding:25px;background:#fff4e9}
+@media(max-width:600px){#toolbar{gap:4px;padding:8px 6px;font-size:11px}#toolbar button{padding:8px 5px}#territory{max-width:130px}
+#detail{top:auto;bottom:30px;right:6px;width:min(315px,calc(100% - 12px));max-height:340px}#hint{font-size:10px;left:50px;max-width:75%}.legend{width:180px}#detail.pinned{max-height:480px}}
+</style></head><body><div id="shell">
+<div id="toolbar"><button id="reset" title="Revenir à la métropole">Métropole</button>
+<select id="overseas" aria-label="Aller dans un département d’outre-mer"><option value="">Outre-mer</option></select>
+<select id="territory" aria-label="Rechercher un département"><option value="">Rechercher un département…</option></select>
+<button id="all" title="Voir tous les départements français">France entière</button></div>
+<div id="map" aria-label="Carte interactive des départements"></div>
+<div id="hint">Survolez pour voir la fiche · Cliquez pour la garder ouverte</div>
+<aside id="detail" aria-live="polite"><button id="close" aria-label="Fermer la fiche">×</button><div id="content"></div></aside>
+<div id="error" role="alert">Le fond interactif n’a pas pu être chargé. Utilisez la vue d’ensemble au-dessus de la carte.</div>
+</div><script id="map-data" type="application/json">__MAP_DATA__</script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(() => {
+if (!window.L) {document.getElementById('map').style.display='none';document.getElementById('error').style.display='block';return;}
+const data=JSON.parse(document.getElementById('map-data').textContent);
+const map=L.map('map',{scrollWheelZoom:true,zoomControl:false,zoomSnap:0.25,zoomDelta:0.5,minZoom:2,maxZoom:15});
+L.control.zoom({position:'topleft',zoomInTitle:'Zoomer',zoomOutTitle:'Dézoomer'}).addTo(map);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{
+ attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',maxZoom:19}).addTo(map);
+L.control.scale({imperial:false,position:'bottomright'}).addTo(map);
+const detail=document.getElementById('detail'), content=document.getElementById('content'), hint=document.getElementById('hint');
+let pinned=null;const layers={};
+const baseStyle=f=>({color:'#607382',weight:1,fillColor:f.properties.color,fillOpacity:.66});
+function show(layer,pin=false){
+ if(pinned && !pin)return;
+ if(pin && pinned)geo.resetStyle(pinned);
+ if(pin)pinned=layer;
+ detail.classList.toggle('pinned',!!pinned);content.innerHTML=layer.feature.properties.card;
+ detail.style.display='block';hint.style.display='none';layer.setStyle({weight:3,color:'#b17a32',fillOpacity:.78});layer.bringToFront();
+}
+function close(){if(pinned)geo.resetStyle(pinned);pinned=null;detail.style.display='none';detail.classList.remove('pinned');hint.style.display='block';}
+const geo=L.geoJSON(data.geojson,{style:baseStyle,onEachFeature:(f,layer)=>{
+ layers[f.properties.code]=layer;
+ layer.on('add',()=>{const el=layer.getElement();if(el){el.setAttribute('data-department',f.properties.code);el.setAttribute('aria-label',f.properties.name);}});
+ layer.on({mouseover:()=>show(layer),mouseout:()=>{if(layer!==pinned)geo.resetStyle(layer);if(!pinned){detail.style.display='none';hint.style.display='block';}},
+ click:e=>{L.DomEvent.stopPropagation(e);show(layer,true);}});
+}}).addTo(map);
+document.getElementById('close').onclick=close;map.on('click',close);
+document.addEventListener('keydown',e=>{if(e.key==='Escape')close();});
+const metro=L.featureGroup(Object.values(layers).filter(l=>!Object.hasOwn(data.drom,l.feature.properties.code)));
+function reset(){close();map.fitBounds(metro.getBounds(),{padding:[20,20]});}
+document.getElementById('reset').onclick=reset;
+document.getElementById('all').onclick=()=>{close();map.fitBounds(geo.getBounds(),{padding:[20,20]});};
+function focus(code){const layer=layers[code];if(!layer)return;close();map.fitBounds(layer.getBounds(),{padding:[35,35],maxZoom:11});show(layer,true);}
+const overseas=document.getElementById('overseas');
+Object.entries(data.drom).forEach(([code,name])=>overseas.add(new Option(name,code)));
+overseas.onchange=()=>{focus(overseas.value);overseas.value='';};
+const territory=document.getElementById('territory');
+Object.entries(layers).sort((a,b)=>a[0].localeCompare(b[0])).forEach(([code,layer])=>territory.add(new Option(code+' · '+layer.feature.properties.name,code)));
+territory.onchange=()=>{focus(territory.value);territory.value='';};
+const legend=L.control({position:'bottomleft'});legend.onAdd=()=>{
+ const div=L.DomUtil.create('div','legend');
+ const title=L.DomUtil.create('div','legend-title',div);title.textContent=data.legend;
+ const bar=L.DomUtil.create('div','legend-bar',div);bar.style.background='linear-gradient(to right,'+data.colors.join(',')+')';
+ const labels=L.DomUtil.create('div','legend-labels',div);const low=L.DomUtil.create('span','',labels),high=L.DomUtil.create('span','',labels);low.textContent=data.min;high.textContent=data.max;
+ const note=L.DomUtil.create('div','legend-note',div);note.textContent='Gris : donnée indisponible · Échelle bornée';
+ L.DomEvent.disableClickPropagation(div);return div;};legend.addTo(map);
+const key='nac-psy-map-view-v1';let restored=false;
+try{const view=JSON.parse(sessionStorage.getItem(key));if(view && Number.isFinite(view.lat) && Number.isFinite(view.lng) && Number.isFinite(view.zoom)){
+ map.setView([view.lat,view.lng],Math.max(2,Math.min(15,view.zoom)));restored=true;}}catch(e){}
+if(!restored)reset();
+map.on('moveend',()=>{try{const c=map.getCenter();sessionStorage.setItem(key,JSON.stringify({lat:c.lat,lng:c.lng,zoom:map.getZoom()}));}catch(e){}});
+new ResizeObserver(()=>map.invalidateSize({pan:false})).observe(document.getElementById('map'));
+})();</script></body></html>'''
+    return html.replace("__MAP_DATA__", data)
+
+
+def france_figure(selected, scale_values, value_label, indicator, gj):
+    """Métropole et cinq encarts DROM, même échelle de couleur partout."""
+    vmin, vmax, colorscale = map_color_scale(scale_values, indicator)
+    unit = " %" if indicator in (SALARIED_SHARE, NEED_COVERAGE) else ""
     fig = go.Figure()
     panels = [("Métropole", METRO, [0.20, 0.88], [0, 1])]
     for index, (dep, label) in enumerate(DROM.items()):
@@ -2993,7 +3157,7 @@ def france_figure(selected, scale_values, value_label, indicator, gj):
         else:
             fig.add_annotation(x=sum(xdomain)/2, y=ydomain[1]+0.02, xref="paper", yref="paper", text=label,
                                showarrow=False, font=dict(size=11), xanchor="center", yanchor="middle")
-    fig.update_layout(**layout, margin=dict(l=0, r=0, t=10, b=0), dragmode=False,
+    fig.update_layout(**layout, margin=dict(l=0, r=0, t=10, b=0), dragmode="pan",
         paper_bgcolor="rgba(0,0,0,0)", separators=", ",
         hoverlabel=dict(bgcolor="white", bordercolor="#dfe4e7", font=dict(size=14, color="#28313a", family="Arial, sans-serif"), align="left"),
         coloraxis=dict(cmin=float(vmin), cmax=float(vmax), colorscale=colorscale,
@@ -3009,8 +3173,20 @@ def render_choropleth(selected, scale_values, value_label, indicator):
         return
     if selected.empty:
         return
-    fig = france_figure(selected, scale_values, value_label, indicator, gj)
-    st.plotly_chart(fig, width="stretch", height="stretch")
+    view = st.radio("Navigation cartographique", ["Carte interactive", "Vue d’ensemble"],
+                    horizontal=True, key="map_navigation", label_visibility="collapsed")
+    if view == "Carte interactive":
+        content = interactive_map_html(selected, scale_values, value_label, indicator, gj)
+        if hasattr(st, "iframe"):
+            st.iframe(content, height=680, alt="Carte interactive des psychiatres par département")
+        else:
+            from streamlit.components.v1 import html as component_html
+            component_html(content, height=680, scrolling=False)
+        st.caption("Zoom : molette, pincement tactile ou boutons +/−. Déplacement : glisser la carte. Recherche et raccourcis outre-mer en haut. Un clic garde la fiche ouverte ; × ou Échap la ferme.")
+    else:
+        fig = france_figure(selected, scale_values, value_label, indicator, gj)
+        st.plotly_chart(fig, width="stretch", height=640,
+                        config={"scrollZoom": True, "displayModeBar": True, "displaylogo": False})
     st.caption("France : 101 départements, métropole et cinq DROM. Encarts ultramarins à des échelles géographiques différentes ; couleurs comparables. Les collectivités d'outre-mer hors départements ne figurent pas dans ces données.")
 
 
