@@ -16,12 +16,13 @@ Ils restent dans st.session_state, sans aucun fichier de résultats ou paramètr
 Chaque utilisateur dispose de ses propres paramètres et projections. Changer
 seulement un filtre d'affichage ne relance pas la simulation.
 
-Interface : deux pages réunies dans le « Tableau de bord » de la barre latérale.
+Interface : trois pages réunies dans le « Tableau de bord » de la barre latérale.
   - Scénarios : choisir un scénario prédéfini, en créer un, l'exporter ou l'importer
     (CSV, une ligne par paramètre). Les paramètres ne s'appliquent qu'au clic sur
     « Appliquer » et reviennent au scénario Base dans une nouvelle session.
   - Projections : carte et sélecteurs (thème, indicateur, projection DREES, année),
     puis les onglets de diagnostic du scénario actif.
+  - Tutoriel : prise en main, scénarios et lecture des résultats.
 
 Si les projections régionales de psychiatrie manquent, repli AUTOMATIQUE :
     N_dep(t, s) = N_RPPS_dep(b) * N_DREES_France(t, s) / N_DREES_France(b, s)
@@ -2653,7 +2654,7 @@ def render_match_tab(matching, error, scenario, year, names):
             st.markdown(f"[{label}]({url})")
 
 
-# ---------- Interface : navigation, page Scénarios, page Projections ----------
+# ---------- Interface : navigation, Scénarios, Projections et Tutoriel ----------
 FAMILY_SUPPLY, FAMILY_DEMAND, FAMILY_MATCH = "Offre", "Demande", "Offre / demande"
 DEMAND_MEASURES = {"count": "personnes avec besoin potentiel", "rate": "pour 1 000 habitants"}
 SIDEBAR_WIDTH = 220  # Pixels.
@@ -2751,6 +2752,171 @@ def render_sidebar_summary(scenario):
         st.caption("SCÉNARIO ACTIF")
         st.markdown(f"**{scenario['nom']}**  \n:gray[{scenario['origine']}]")
         st.caption("  \n".join(scenario_short_lines(scenario)))
+
+
+def render_tutorial_page(app, projections_page, scenarios_page):
+    """Guide de lecture sans modification du scénario actif ou de son brouillon."""
+    anchor = app["context"]["anchor"]
+    formation = app["predefined"]["Hausse des places de formation"]["offre"]["formation"]
+    first_arrival = formation["rentree"] + formation["delai"]
+    st.title("Tutoriel")
+    st.write("Découvrez les écrans, construisez un scénario et apprenez à lire ses effets sur "
+             "l'offre de psychiatres, les besoins de soins et leur rapprochement.")
+    st.caption(f"Scénario actuellement appliqué : {st.session_state.scenario_active['nom']}. "
+               "La consultation de ce guide conserve vos réglages.")
+    scenarios_link, projections_link = st.columns(2)
+    scenarios_link.page_link(scenarios_page, label="Ouvrir les scénarios", icon=":material/tune:")
+    projections_link.page_link(projections_page, label="Ouvrir les projections", icon=":material/map:")
+    start, scenarios, results, practice = st.tabs(
+        ["Prise en main", "Comprendre les scénarios", "Lire les onglets", "Exemple pas à pas"])
+
+    with start:
+        st.subheader("Votre premier parcours")
+        st.markdown("""
+1. Dans le **Tableau de bord** à gauche, ouvrez **Scénarios**. Pour commencer, choisissez **Base** puis **Appliquer**.
+2. Vous arrivez dans **Projections**. Le nom du **SCÉNARIO ACTIF**, dans la barre de gauche, confirme les paramètres utilisés.
+3. Dans **Carte et indicateurs**, les commandes sont **sous la carte** : faites défiler la page pour choisir le thème, l'indicateur, la projection DREES et l'année.
+4. Explorez ensuite les autres onglets pour comprendre les évolutions et les hypothèses. **Changer de scénario** vous ramène aux réglages.
+"""
+        )
+        a, b, c = st.columns(3)
+        with a.container(border=True):
+            st.markdown("**Offre**")
+            st.write("Combien de psychiatres sont projetés, où exercent-ils et quelle est leur répartition par statut ?")
+        with b.container(border=True):
+            st.markdown("**Demande**")
+            st.write("Combien de personnes pourraient être concernées par les besoins de soins retenus ?")
+        with c.container(border=True):
+            st.markdown("**Offre / demande**")
+            st.write("Quelle capacité théorique de soins correspond à l'offre, et comment se situe-t-elle par rapport au besoin ciblé ?")
+        st.info("Modifier un filtre d'affichage permet d'explorer le scénario actif. Pour changer les "
+                "hypothèses de calcul, passez par Scénarios puis cliquez sur Appliquer.")
+
+    with scenarios:
+        st.subheader("Quatre choix à distinguer")
+        st.table(pd.DataFrame([
+            {"Choix": "Scénario de l'application", "Rôle": "Ensemble des paramètres d'offre, de politiques publiques et de rapprochement.",
+             "Où le régler ?": "Page Scénarios → Appliquer"},
+            {"Choix": "Projection DREES", "Rôle": "Trajectoire de référence des effectifs de psychiatres. Elle ne change pas la demande.",
+             "Où le régler ?": "Projections → Carte et indicateurs, sous la carte"},
+            {"Choix": "Scénario démographique Insee", "Rôle": "Évolution de la population utilisée pour calculer les besoins.",
+             "Où le régler ?": "Scénarios → Créer un scénario → Offre / demande"},
+            {"Choix": "Scénario de besoin", "Rôle": "Évolution des prévalences : stable, besoin_haut ou besoin_bas.",
+             "Où le régler ?": "Scénarios → Créer un scénario → Offre / demande"},
+        ]))
+        st.caption("Les choix Insee et de besoin de l'onglet Demande de soins sont des filtres d'exploration "
+                   "indépendants. Ils ne remplacent pas ceux du scénario actif utilisés sur la carte et dans Offre / demande.")
+
+        with st.expander("1. Essayer un scénario prédéfini", expanded=True):
+            st.write("Dans Scénarios prédéfinis, chaque carte décrit ce qui change par rapport à Base. "
+                     "Appliquer active immédiatement ce scénario ; Personnaliser le copie dans l'éditeur ; "
+                     "Exporter télécharge ses paramètres.")
+            for scenario in app["predefined"].values():
+                st.markdown(f"**{scenario['nom']}** — {scenario['description']}")
+            st.caption("Base comporte déjà les dynamiques départementales, la correction de l'internat "
+                       "et la tendance des diplômés à l'étranger. Une hausse étrangère à 0 % conserve cette tendance.")
+
+        with st.expander("2. Créer et appliquer votre scénario"):
+            st.markdown("""
+1. Cliquez sur **Personnaliser**, ou choisissez **Créer un scénario**.
+2. Donnez-lui un nom. Pour repartir d'un jeu de paramètres, choisissez **Partir des valeurs de** puis **Charger** : les réglages du brouillon sont remplacés, son nom est conservé.
+3. Ajustez les quatre groupes ci-dessous. Vérifiez les écarts au scénario Base affichés en bas de page.
+4. Cliquez sur **Appliquer ce scénario**. Après validation, l'application ouvre Projections et calcule les résultats. Un message signale les paramètres invalides.
+"""
+            )
+            st.table(pd.DataFrame([
+                {"Groupe": "Paramètres structurels", "Ce que vous réglez": "Périmètre avec ou sans pédopsychiatrie ; dynamiques départementales ; correction de l'internat (linéaire ou plateau) ; période de tendance des diplômés à l'étranger."},
+                {"Groupe": "Politiques publiques", "Ce que vous réglez": "Hausse des places par région, première rentrée et délai d'installation ; hausse supplémentaire des arrivées de diplômés à l'étranger et année de début."},
+                {"Groupe": "Politiques de demande", "Ce que vous réglez": "Trouble et âges ciblés, baisse relative de prévalence, début, fin et montée en charge de chaque politique nationale."},
+                {"Groupe": "Offre / demande", "Ce que vous réglez": "Scénarios Insee et de besoin, besoin de référence, activité par psychiatre, actes par personne, couverture cible, part mobilisable et marge de sensibilité."},
+            ]))
+            st.info("Un brouillon reste un brouillon jusqu'au clic sur Appliquer ce scénario. "
+                    "Changer de page conserve le brouillon pendant la session, mais les projections utilisent le dernier scénario appliqué.")
+            st.write("Dans les places de formation, Appliquer à toutes les régions copie seulement la hausse "
+                     "dans les curseurs du brouillon. Cliquez ensuite sur Appliquer ce scénario pour l'utiliser.")
+
+        with st.expander("3. Comprendre les délais et les pourcentages"):
+            st.markdown(
+                f"- **Formation** : +20 % est une hausse reconduite pour chaque cohorte. Avec une rentrée "
+                f"en **{formation['rentree']}** et un délai de **{formation['delai']} ans**, les premiers effets "
+                f"apparaissent en **{first_arrival}**. Le lieu de formation peut différer du lieu d'exercice.\n"
+                "- **Diplômés à l'étranger** : la hausse supplémentaire agit dès l'année choisie, sans délai de formation. "
+                "Elle majore l'accroissement net positif retenu par le modèle ; ce pourcentage ne représente pas les entrées brutes observées.\n"
+                "- **Prévention** : une baisse relative de 10 % transforme une prévalence de 20 % en 18 %. "
+                "Avec trois ans de montée en charge, un tiers, puis deux tiers, puis tout l'effet s'appliquent. "
+                "L'effet cesse après la dernière année choisie. Il ne se cumule pas à nouveau chaque année.\n"
+                "- **Politiques simultanées** : leurs effets se multiplient sur les âges communs. "
+                "−10 % puis −15 % donnent −23,5 %. Sans données sur un âge ou un trouble, aucun effet n'est calculé."
+            )
+            st.caption("Exclure les pédopsychiatres retire également la demande des moins de 18 ans. "
+                       "Un curseur régional désactivé indique une calibration indisponible pour ce lieu de formation.")
+
+        with st.expander("4. Exporter, partager et retrouver un scénario"):
+            st.write("Exporter (.csv) en haut de Scénarios sauvegarde le scénario actif. Dans l'éditeur, "
+                     "le bouton du bas exporte le brouillon ; sur une carte prédéfinie, il exporte ce prédéfini.")
+            st.write("Pour le retrouver : Importer un scénario → charger le CSV → vérifier les valeurs et "
+                     "les éventuels avertissements → Appliquer ce scénario, ou Modifier avant d'appliquer. "
+                     "Les paramètres absents sont complétés à partir de Base ; les valeurs hors limites sont refusées.")
+            st.write("Le CSV contient les paramètres et les politiques de demande. Pour reproduire une vue, "
+                     "notez aussi la projection DREES, l'année, l'indicateur et les départements sélectionnés. "
+                     "Les fichiers facultatifs de population et d'activité doivent être transmis séparément : "
+                     "ils s'appliquent à tous les scénarios de la session.")
+            st.caption("Une nouvelle session ou une modification du code ou des sources revient à Base. "
+                       "Exportez vos réglages avant de fermer ou de redémarrer l'application.")
+
+    with results:
+        st.subheader("Les sept onglets de Projections")
+        st.write("Le nom du scénario actif et le bouton d'information en haut de Projections permettent "
+                 "de vérifier les hypothèses utilisées à tout moment.")
+        guides = (
+            ("Carte et indicateurs",
+             "Choisissez le thème Offre, Demande ou Offre / demande, puis l'indicateur, la projection DREES et l'année sous la carte. Survolez un département pour consulter ses valeurs ; utilisez Valeurs par département pour lire le tableau.",
+             "La navigation cartographique propose Carte interactive et Vue d'ensemble. Vérifiez l'unité : effectif, pourcentage, personnes pour 1 000 habitants ou actes. Un solde négatif signale un écart à la cible ; la cible dépend des hypothèses de rapprochement."),
+            ("Dynamiques départementales",
+             "Sélectionnez les départements à comparer et, si utile, affichez la droite estimée sur les observations. Le tableau donne les pentes et le volet de décomposition détaille les effets dans l'année choisie.",
+             f"Les courbes mesurent l'écart au total national final multiplié par la part départementale de {anchor}. Zéro signifie que le département suit cette référence. Trait plein : observations ; tirets : projection. Le filtre Année de la carte ne tronque pas ces courbes."),
+            ("Statuts d’exercice",
+             "Comparez la part de salariés et les effectifs salariés ou libéraux/mixte des départements sélectionnés.",
+             "Le groupe libéral inclut l'exercice mixte. Les deux groupes reconstituent l'effectif total ; la part de salariés s'exprime en pourcentage."),
+            ("Internat national",
+             "Examinez les postes non pourvus, leur prolongement selon la méthode choisie et les flux avant/après correction.",
+             "La méthode, la période d'estimation et l'activation se règlent dans Scénarios → Paramètres structurels. Le décalage de cinq ans de cette correction est distinct du délai de formation réglé pour l'ouverture de places."),
+            ("Demande de soins",
+             "Explorez les scénarios démographiques, les scénarios de besoin, les indicateurs et les départements avec les filtres propres à cet onglet.",
+             "Ces filtres ne changent pas les choix validés pour la carte ou le rapprochement. Les politiques de demande du scénario actif s'appliquent. Les personnes concernées sont un besoin potentiel ; le cumul adulte dépression/anxiété suppose l'absence de recouvrement."),
+            ("Offre / demande",
+             "Comparez les actes disponibles, les actes nécessaires, l'effectif cible et les manques départementaux. Sélectionnez les départements et la courbe à afficher ; exportez le rapprochement annuel si besoin.",
+             "La cible dépend notamment de la couverture, des actes par personne et de l'activité mobilisable. La fourchette est une sensibilité à l'activité, pas un intervalle de confiance. Les surplus d'un département ne compensent pas automatiquement les manques d'un autre."),
+            ("Calibration et hypothèses",
+             "Retrouvez la méthode, les sources, la calibration des places et les conventions du modèle pour expliquer un résultat.",
+             "Le tableau de formation décrit l'effet de +1 % pour la première cohorte. Les cohortes suivantes s'accumulent. Les résultats sont des scénarios exploratoires dont les hypothèses doivent accompagner toute présentation."),
+        )
+        for title, action, interpretation in guides:
+            with st.expander(title, expanded=title == "Carte et indicateurs"):
+                st.write(action)
+                st.caption(interpretation)
+
+    with practice:
+        st.subheader("Comparer Base et une hausse des places")
+        st.write("Cet exercice se réalise dans les pages Scénarios et Projections. Il vous permet "
+                 "d'isoler l'effet d'une seule politique ; lire ces instructions ne l'applique pas.")
+        st.markdown(
+            "1. Dans **Scénarios prédéfinis**, appliquez **Base**.\n"
+            "2. Dans **Carte et indicateurs**, choisissez **Offre → Effectif de psychiatres**, "
+            "une **projection DREES** et l'année **2040**. Relevez les valeurs des départements qui vous intéressent.\n"
+            "3. Revenez à **Scénarios** et appliquez **Hausse des places de formation** : "
+            "+20 % dans chaque région calibrée, les autres réglages restant ceux de Base.\n"
+            "4. Retrouvez **la même projection DREES, l'année 2040, le même indicateur et les mêmes départements**. "
+            "Comparez les valeurs et ouvrez la décomposition dans **Dynamiques départementales**.\n"
+            f"5. Vérifiez une année avant **{first_arrival}** : l'ouverture de places n'y a pas encore d'effet. "
+            "Observez ensuite la montée des effets après les premières installations.\n"
+            "6. Dans **Offre / demande**, examinez l'évolution de la cible et du manque en conservant "
+            "les mêmes hypothèses de demande et d'activité. Exportez les scénarios et les résultats utiles pour votre comparaison."
+        )
+        st.info("Pour attribuer une différence à un levier, gardez les autres réglages identiques. "
+                "Changer simultanément la projection DREES, la population Insee et une politique rend leurs effets difficiles à distinguer.")
+        st.caption("Les résultats affichent un seul scénario actif à la fois. Pour revenir au point de départ, "
+                   "appliquez à nouveau Base. Pour tester une variante, personnalisez-la puis appliquez-la.")
 
 
 def render_scenarios_page(app, projections_page):
@@ -3539,9 +3705,13 @@ def main():
     def scenarios():
         render_scenarios_page(app, pages["projections"])
 
+    def tutorial():
+        render_tutorial_page(app, pages["projections"], pages["scenarios"])
+
     pages["projections"] = st.Page(projections, title="Projections", icon=":material/map:", url_path="projections", default=True)
     pages["scenarios"] = st.Page(scenarios, title="Scénarios", icon=":material/tune:", url_path="scenarios")
-    navigation = st.navigation({"Tableau de bord": [pages["projections"], pages["scenarios"]]})
+    pages["tutorial"] = st.Page(tutorial, title="Tutoriel", icon=":material/school:", url_path="tutoriel")
+    navigation = st.navigation({"Tableau de bord": [pages["projections"], pages["scenarios"], pages["tutorial"]]})
     render_sidebar_summary(st.session_state.scenario_active)
     navigation.run()
 
